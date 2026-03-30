@@ -461,55 +461,55 @@ def _finish_ax(ax, ylabel, title, show_legend=True):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_bearing_group(results: dict):
-    scenarios = [
-        ("pump_bearing_wear",   "Thrust bearing wear (FAILURE)"),
-        ("decoy_highload_step", "High-load step (NORMAL decoy)"),
-        ("decoy_highload_ramp", "High-load ramp (NORMAL decoy)"),
+    all_scenarios = [
+        ("normal",              "Healthy",          COLOURS["normal"]),
+        ("pump_bearing_wear",   "Bearing wear",     COLOURS["failure"]),
+        ("decoy_highload_step", "High-load step",   COLOURS["decoy"]),
+        ("decoy_highload_ramp", "High-load ramp",   "#2196F3"),
     ]
 
-    fig, axes = plt.subplots(3, 2, figsize=(12, 9))
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
     fig.suptitle(
         "Thrust bearing wear vs high-load decoys\n"
-        "Both show Tt rising — but failure rises FASTER than load explains\n"
-        "Decoy: Tt rises proportionally to speed increase (no excess heat)",
-        fontsize=11, fontweight="bold", y=0.99
+        "All show Tt rising — the discriminator is Tt vs speed relationship",
+        fontsize=11, fontweight="bold", y=1.02
     )
 
-    normal_df = results.get("normal")
+    # Panel 1: Tt over time (all overlaid)
+    ax = axes[0]
+    for name, label, colour in all_scenarios:
+        df = results[name]
+        ax.plot(df["time_h"], df["thrust_bearing_K"],
+                color=colour, linewidth=1.2, label=label, alpha=0.8)
+    _finish_ax(ax, "Thrust bearing Tt (K)", "Tt over time (all scenarios)")
 
-    for row, (name, title) in enumerate(scenarios):
-        df     = results[name]
-        colour = COLOURS["failure"] if "wear" in name else COLOURS["decoy"]
+    # Panel 2: shaft speed over time (all overlaid)
+    ax = axes[1]
+    for name, label, colour in all_scenarios:
+        df = results[name]
+        ax.plot(df["time_h"], df["shaft_speed_rads"],
+                color=colour, linewidth=1.2, label=label, alpha=0.8)
+    _finish_ax(ax, "Shaft speed (rad/s)", "Speed over time (all scenarios)")
 
-        # Left: thrust bearing temperature (both rise — rate is the discriminator)
-        ax = axes[row, 0]
-        _shade_labels(ax, df)
-        _plot_line(ax, df, "thrust_bearing_K", colour, "Tt (this scenario)")
-        if normal_df is not None:
-            ax.plot(normal_df["time_h"], normal_df["thrust_bearing_K"],
-                    color="#999", linewidth=1.0, linestyle="--", label="Tt (healthy)")
-        _finish_ax(ax, "Thrust bearing Tt (K)", title)
+    # Panel 3: scatter speed vs Tt — reveals the discrimination
+    ax = axes[2]
+    for name, label, colour in all_scenarios:
+        df = results[name]
+        ax.scatter(df["shaft_speed_rads"], df["thrust_bearing_K"],
+                   color=colour, s=4, alpha=0.5, label=label)
+    ax.set_xlabel("Shaft speed (rad/s)", fontsize=8)
+    ax.set_ylabel("Thrust bearing Tt (K)", fontsize=8)
+    ax.set_title("Speed vs Tt  (the discriminator)", fontsize=9, fontweight="bold")
+    ax.legend(fontsize=7, framealpha=0.7)
+    ax.grid(True, alpha=0.25, linewidth=0.5)
+    ax.tick_params(labelsize=7)
 
-        # Right: shaft speed (decoys show speed increasing, failure doesn't)
-        ax = axes[row, 1]
-        _shade_labels(ax, df)
-        _plot_line(ax, df, "shaft_speed_rads", colour, "shaft speed")
-        if normal_df is not None:
-            ax.plot(normal_df["time_h"], normal_df["shaft_speed_rads"],
-                    color="#999", linewidth=1.0, linestyle="--", label="w (healthy)")
-        _finish_ax(ax, "Shaft speed (rad/s)", title)
-
-    axes[0, 0].set_title("thrust_bearing_K (Tt)\n" + axes[0, 0].get_title(),
-                          fontsize=9, fontweight="bold", pad=4)
-    axes[0, 1].set_title("shaft_speed_rads\n" + axes[0, 1].get_title(),
-                          fontsize=9, fontweight="bold", pad=4)
-
-    fig.text(0.5, 0.01,
-             "Failure: Tt rises with NO speed increase (excess friction heat)  |  "
-             "Decoy: Tt rises WITH speed increase (expected load heat)",
+    fig.text(0.5, -0.02,
+             "Failure: Tt is HIGHER than expected for its speed (points shift up)  |  "
+             "Decoys: Tt tracks speed proportionally (same band as healthy)",
              ha="center", fontsize=8, color="#555")
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.tight_layout()
     fig.savefig("plots/1_bearing_wear_group.png", dpi=150, bbox_inches="tight")
     plt.close()
     print("  → plots/1_bearing_wear_group.png")
@@ -523,55 +523,55 @@ def plot_bearing_group(results: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_impeller_group(results: dict):
-    scenarios = [
-        ("pump_impeller_wear",       "Impeller wear (FAILURE)"),
-        ("decoy_back_pressure_step", "Back pressure step (NORMAL decoy)"),
-        ("decoy_back_pressure_ramp", "Back pressure ramp (NORMAL decoy)"),
+    all_scenarios = [
+        ("normal",                   "Healthy",           COLOURS["normal"]),
+        ("pump_impeller_wear",       "Impeller wear",     COLOURS["failure"]),
+        ("decoy_back_pressure_step", "Back-press step",   COLOURS["decoy"]),
+        ("decoy_back_pressure_ramp", "Back-press ramp",   "#2196F3"),
     ]
 
-    fig, axes = plt.subplots(3, 2, figsize=(12, 9))
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
     fig.suptitle(
         "Impeller wear vs back-pressure decoys  (observable signals only)\n"
-        "Both show flow dropping — but failure also shows temp rising at same speed\n"
-        "Decoy: flow drops because pressure changed, temp stays proportional",
-        fontsize=11, fontweight="bold", y=0.99
+        "Both show flow dropping — the discriminator is flow vs temperature relationship",
+        fontsize=11, fontweight="bold", y=1.02
     )
 
-    normal_df = results.get("normal")
+    # Panel 1: flow_out over time
+    ax = axes[0]
+    for name, label, colour in all_scenarios:
+        df = results[name]
+        ax.plot(df["time_h"], df["flow_out_m3s"],
+                color=colour, linewidth=1.2, label=label, alpha=0.8)
+    _finish_ax(ax, "Flow out (m³/s)", "Flow over time (all scenarios)")
 
-    for row, (name, title) in enumerate(scenarios):
-        df     = results[name]
-        colour = COLOURS["failure"] if "wear" in name else COLOURS["decoy"]
+    # Panel 2: oil temp over time
+    ax = axes[1]
+    for name, label, colour in all_scenarios:
+        df = results[name]
+        ax.plot(df["time_h"], df["fluid_temp_K"],
+                color=colour, linewidth=1.2, label=label, alpha=0.8)
+    _finish_ax(ax, "Oil temperature To (K)", "Oil temp over time (all scenarios)")
 
-        # Left: flow_out (both show reduction — this alone can't discriminate)
-        ax = axes[row, 0]
-        _shade_labels(ax, df)
-        _plot_line(ax, df, "flow_out_m3s", colour, "flow out")
-        if normal_df is not None:
-            ax.plot(normal_df["time_h"], normal_df["flow_out_m3s"],
-                    color="#999", linewidth=1.0, linestyle="--", label="flow (healthy)")
-        _finish_ax(ax, "Flow out (m³/s)", title)
+    # Panel 3: scatter flow vs temp — reveals discrimination
+    ax = axes[2]
+    for name, label, colour in all_scenarios:
+        df = results[name]
+        ax.scatter(df["flow_out_m3s"], df["fluid_temp_K"],
+                   color=colour, s=4, alpha=0.5, label=label)
+    ax.set_xlabel("Flow out (m³/s)", fontsize=8)
+    ax.set_ylabel("Oil temperature To (K)", fontsize=8)
+    ax.set_title("Flow vs To  (the discriminator)", fontsize=9, fontweight="bold")
+    ax.legend(fontsize=7, framealpha=0.7)
+    ax.grid(True, alpha=0.25, linewidth=0.5)
+    ax.tick_params(labelsize=7)
 
-        # Right: fluid temp (failure → temp rises from extra friction/recirculation)
-        ax = axes[row, 1]
-        _shade_labels(ax, df)
-        _plot_line(ax, df, "fluid_temp_K", colour, "To (this scenario)")
-        if normal_df is not None:
-            ax.plot(normal_df["time_h"], normal_df["fluid_temp_K"],
-                    color="#999", linewidth=1.0, linestyle="--", label="To (healthy)")
-        _finish_ax(ax, "Oil temperature To (K)", title)
-
-    axes[0, 0].set_title("flow_out_m3s\n" + axes[0,0].get_title(),
-                          fontsize=9, fontweight="bold", pad=4)
-    axes[0, 1].set_title("fluid_temp_K (To)\n" + axes[0,1].get_title(),
-                          fontsize=9, fontweight="bold", pad=4)
-
-    fig.text(0.5, 0.01,
-             "Failure: flow drops AND temp diverges from healthy (hidden A degradation)  |  "
-             "Decoy: flow drops but temp stays near healthy baseline",
+    fig.text(0.5, -0.02,
+             "Failure: temp is HIGHER than expected for its flow (points shift up)  |  "
+             "Decoys: temp tracks flow proportionally (same band as healthy)",
              ha="center", fontsize=8, color="#555")
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.tight_layout()
     fig.savefig("plots/2_impeller_wear_group.png", dpi=150, bbox_inches="tight")
     plt.close()
     print("  → plots/2_impeller_wear_group.png")
@@ -585,55 +585,55 @@ def plot_impeller_group(results: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_seal_group(results: dict):
-    scenarios = [
-        ("pump_radial_wear",             "Radial bearing wear (FAILURE)"),
-        ("decoy_radial_highload_step",   "High-load step (NORMAL decoy)"),
-        ("decoy_radial_highload_ramp",   "High-load ramp (NORMAL decoy)"),
+    all_scenarios = [
+        ("normal",                       "Healthy",          COLOURS["normal"]),
+        ("pump_radial_wear",             "Radial wear",      COLOURS["failure"]),
+        ("decoy_radial_highload_step",   "High-load step",   COLOURS["decoy"]),
+        ("decoy_radial_highload_ramp",   "High-load ramp",   "#2196F3"),
     ]
 
-    fig, axes = plt.subplots(3, 2, figsize=(12, 9))
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
     fig.suptitle(
         "Radial bearing wear vs high-load decoys\n"
-        "Both show Tr rising — but failure rises FASTER than load explains\n"
-        "Decoy: Tr rises proportionally to speed increase (no excess heat)",
-        fontsize=11, fontweight="bold", y=0.99
+        "All show Tr rising — the discriminator is Tr vs speed relationship",
+        fontsize=11, fontweight="bold", y=1.02
     )
 
-    normal_df = results.get("normal")
+    # Panel 1: Tr over time
+    ax = axes[0]
+    for name, label, colour in all_scenarios:
+        df = results[name]
+        ax.plot(df["time_h"], df["radial_bearing_K"],
+                color=colour, linewidth=1.2, label=label, alpha=0.8)
+    _finish_ax(ax, "Radial bearing Tr (K)", "Tr over time (all scenarios)")
 
-    for row, (name, title) in enumerate(scenarios):
-        df     = results[name]
-        colour = COLOURS["failure"] if "wear" in name else COLOURS["decoy"]
+    # Panel 2: shaft speed over time
+    ax = axes[1]
+    for name, label, colour in all_scenarios:
+        df = results[name]
+        ax.plot(df["time_h"], df["shaft_speed_rads"],
+                color=colour, linewidth=1.2, label=label, alpha=0.8)
+    _finish_ax(ax, "Shaft speed (rad/s)", "Speed over time (all scenarios)")
 
-        # Left: radial bearing temperature
-        ax = axes[row, 0]
-        _shade_labels(ax, df)
-        _plot_line(ax, df, "radial_bearing_K", colour, "Tr (this scenario)")
-        if normal_df is not None:
-            ax.plot(normal_df["time_h"], normal_df["radial_bearing_K"],
-                    color="#999", linewidth=1.0, linestyle="--", label="Tr (healthy)")
-        _finish_ax(ax, "Radial bearing Tr (K)", title)
+    # Panel 3: scatter speed vs Tr
+    ax = axes[2]
+    for name, label, colour in all_scenarios:
+        df = results[name]
+        ax.scatter(df["shaft_speed_rads"], df["radial_bearing_K"],
+                   color=colour, s=4, alpha=0.5, label=label)
+    ax.set_xlabel("Shaft speed (rad/s)", fontsize=8)
+    ax.set_ylabel("Radial bearing Tr (K)", fontsize=8)
+    ax.set_title("Speed vs Tr  (the discriminator)", fontsize=9, fontweight="bold")
+    ax.legend(fontsize=7, framealpha=0.7)
+    ax.grid(True, alpha=0.25, linewidth=0.5)
+    ax.tick_params(labelsize=7)
 
-        # Right: shaft speed
-        ax = axes[row, 1]
-        _shade_labels(ax, df)
-        _plot_line(ax, df, "shaft_speed_rads", colour, "shaft speed")
-        if normal_df is not None:
-            ax.plot(normal_df["time_h"], normal_df["shaft_speed_rads"],
-                    color="#999", linewidth=1.0, linestyle="--", label="w (healthy)")
-        _finish_ax(ax, "Shaft speed (rad/s)", title)
-
-    axes[0, 0].set_title("radial_bearing_K (Tr)\n" + axes[0,0].get_title(),
-                          fontsize=9, fontweight="bold", pad=4)
-    axes[0, 1].set_title("shaft_speed_rads\n" + axes[0,1].get_title(),
-                          fontsize=9, fontweight="bold", pad=4)
-
-    fig.text(0.5, 0.01,
-             "Failure: Tr rises with NO speed increase (excess friction heat)  |  "
-             "Decoy: Tr rises WITH speed increase (expected load heat)",
+    fig.text(0.5, -0.02,
+             "Failure: Tr is HIGHER than expected for its speed (points shift up)  |  "
+             "Decoys: Tr tracks speed proportionally (same band as healthy)",
              ha="center", fontsize=8, color="#555")
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.tight_layout()
     fig.savefig("plots/3_radial_wear_group.png", dpi=150, bbox_inches="tight")
     plt.close()
     print("  → plots/3_radial_wear_group.png")
