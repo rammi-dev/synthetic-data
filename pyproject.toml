@@ -1,0 +1,15 @@
+[project]
+name = "synthetic-data"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "ipympl>=0.10.0",
+    "jupyter>=1.1.1",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.4",
+    "pandas>=3.0.1",
+    "progpy>=1.7.1",
+    "pyarrow>=23.0.1",
+]
