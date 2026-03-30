@@ -12,4 +12,3 @@ wheels/
 # Generated data and plots
 sample_data/
 plots/
-sample_visualiser_executed.ipynb
