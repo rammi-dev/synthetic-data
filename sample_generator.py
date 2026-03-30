@@ -517,9 +517,9 @@ def plot_bearing_group(results: dict):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Plot 2 — Impeller wear group
-#   Key signals: impeller_area_A (state), flow_out_m3s
-#   Failure: wA > 0 → A shrinks over time → flow capacity degrades
-#   Decoys: back pressure change reduces flow but A stays at 12.7
+#   Observable signals only: flow_out, fluid_temp (To), shaft_speed
+#   Failure: flow drops + temp rises at SAME speed → hidden A degradation
+#   Decoys: flow drops because pressure changed (observable cause)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_impeller_group(results: dict):
@@ -531,36 +531,44 @@ def plot_impeller_group(results: dict):
 
     fig, axes = plt.subplots(3, 2, figsize=(12, 9))
     fig.suptitle(
-        "Impeller wear vs back-pressure decoys\n"
-        "Correct rule: A (impeller area) shrinks  →  impeller wear\n"
-        "Decoys reduce flow via pressure but A stays constant",
+        "Impeller wear vs back-pressure decoys  (observable signals only)\n"
+        "Both show flow dropping — but failure also shows temp rising at same speed\n"
+        "Decoy: flow drops because pressure changed, temp stays proportional",
         fontsize=11, fontweight="bold", y=0.99
     )
+
+    normal_df = results.get("normal")
 
     for row, (name, title) in enumerate(scenarios):
         df     = results[name]
         colour = COLOURS["failure"] if "wear" in name else COLOURS["decoy"]
 
-        # Left: impeller area A (the discriminating signal)
+        # Left: flow_out (both show reduction — this alone can't discriminate)
         ax = axes[row, 0]
         _shade_labels(ax, df)
-        _plot_line(ax, df, "impeller_area_A", colour, "A (impeller area)")
-        _finish_ax(ax, "Impeller area A", title, show_legend=False)
+        _plot_line(ax, df, "flow_out_m3s", colour, "flow out")
+        if normal_df is not None:
+            ax.plot(normal_df["time_h"], normal_df["flow_out_m3s"],
+                    color="#999", linewidth=1.0, linestyle="--", label="flow (healthy)")
+        _finish_ax(ax, "Flow out (m³/s)", title)
 
-        # Right: flow_out (both failure and decoys show reduction)
+        # Right: fluid temp (failure → temp rises from extra friction/recirculation)
         ax = axes[row, 1]
         _shade_labels(ax, df)
-        _plot_line(ax, df, "flow_out_m3s", colour, "flow out")
-        _finish_ax(ax, "Flow out (m³/s)", title, show_legend=False)
+        _plot_line(ax, df, "fluid_temp_K", colour, "To (this scenario)")
+        if normal_df is not None:
+            ax.plot(normal_df["time_h"], normal_df["fluid_temp_K"],
+                    color="#999", linewidth=1.0, linestyle="--", label="To (healthy)")
+        _finish_ax(ax, "Oil temperature To (K)", title)
 
-    axes[0, 0].set_title("impeller_area_A (state)\n" + axes[0,0].get_title(),
+    axes[0, 0].set_title("flow_out_m3s\n" + axes[0,0].get_title(),
                           fontsize=9, fontweight="bold", pad=4)
-    axes[0, 1].set_title("flow_out_m3s\n" + axes[0,1].get_title(),
+    axes[0, 1].set_title("fluid_temp_K (To)\n" + axes[0,1].get_title(),
                           fontsize=9, fontweight="bold", pad=4)
 
     fig.text(0.5, 0.01,
-             "Failure: A shrinks from 12.7 → 9.5 as impeller erodes  |  "
-             "Decoys: A stays flat at 12.7 — flow drop is from pressure, not wear",
+             "Failure: flow drops AND temp diverges from healthy (hidden A degradation)  |  "
+             "Decoy: flow drops but temp stays near healthy baseline",
              ha="center", fontsize=8, color="#555")
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
