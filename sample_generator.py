@@ -527,28 +527,35 @@ def _tile_signals(total_rows: int, rng: np.random.Generator,
 
 
 def _splice_window(series: np.ndarray, splice_data: np.ndarray,
-                   start_row: int, blend_rows: int = 5) -> None:
-    """Overwrite series[start_row:start_row+len(splice)] with crossfade blend."""
+                   start_row: int, blend_rows: int = 30) -> None:
+    """
+    Splice data into series at start_row.
+
+    The splice is shifted so its starting values match the series at the
+    insertion point (preserving the degradation *trend* while eliminating
+    the jump from different initial conditions). A cosine crossfade over
+    blend_rows smooths the entry transition.
+    """
     n = min(len(splice_data), len(series) - start_row)
     if n <= 0:
         return
     end_row = start_row + n
+    splice = splice_data[:n].copy()
 
-    # Blend entry
+    # Shift splice to match series at insertion point
+    # offset = series_value_at_splice_start - splice_value_at_start
+    offset = series[start_row] - splice[0]
+    splice += offset
+
+    # Cosine crossfade entry (smoother than linear)
     b = min(blend_rows, n)
     for i in range(b):
-        alpha = i / b
-        series[start_row + i] = (1 - alpha) * series[start_row + i] + alpha * splice_data[i]
+        alpha = 0.5 * (1 - np.cos(np.pi * i / b))  # 0→1 smooth
+        series[start_row + i] = (1 - alpha) * series[start_row + i] + alpha * splice[i]
 
-    # Bulk copy middle
+    # Bulk copy the rest
     if b < n:
-        series[start_row + b:end_row] = splice_data[b:n]
-
-    # Blend exit (last few rows back to what follows)
-    if end_row < len(series) and b < n:
-        for i in range(min(blend_rows, len(series) - end_row)):
-            alpha = i / blend_rows
-            series[end_row + i] = alpha * series[end_row + i] + (1 - alpha) * splice_data[-1]
+        series[start_row + b:end_row] = splice[b:n]
 
 
 def generate_long_series(
