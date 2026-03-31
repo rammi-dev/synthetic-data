@@ -14,7 +14,4 @@ sample_data/
 plots/
 fleet_data/
 test_fleet/
-*_executed.ipynb
-^output.ipynb
-^output_downsampled.ipynb
-output_*.ipynb
+
