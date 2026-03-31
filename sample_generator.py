@@ -703,40 +703,68 @@ def generate_long_series(
             print(f"    Failure spliced: rows {fail_start_row}-{fail_end_row} "
                   f"({n_fail} rows, {n_fail * save_freq_s / 3600:.1f}h)", flush=True)
 
-    # ── 3b. Post-failure flatline — pump is dead ──────────────────────────────
-    # After failure the device stops: speed→0, flow→0, temps→ambient + sensor noise
-    if fail_end_row is not None and fail_end_row < total_rows:
-        dead_rows = total_rows - fail_end_row
-        dead_values = {
-            'shaft_speed_rads': 0.0,
-            'flow_out_m3s':     0.0,
-            'thrust_bearing_K': TAMB,
-            'radial_bearing_K': TAMB,
-            'fluid_temp_K':     TAMB,
-            'flow_in_m3s':      0.0,
-            'pump_speed_rads':  0.0,
-            'impeller_area_A':  signals[fail_end_row - 1, _SIGNAL_COLS.index('impeller_area_A')],
-            'r_thrust':         signals[fail_end_row - 1, _SIGNAL_COLS.index('r_thrust')],
-            'r_radial':         signals[fail_end_row - 1, _SIGNAL_COLS.index('r_radial')],
-        }
-        for i, col in enumerate(_SIGNAL_COLS):
-            base_val = dead_values[col]
-            noise_std = _TILE_NOISE_STD[col] * 0.5  # quieter sensor noise on dead pump
-            signals[fail_end_row:, i] = base_val + rng.normal(0, noise_std, size=dead_rows)
+    # ── 3b. Post-failure: 6h downtime then normal operations resume ─────────
+    # After failure: pump stops for 6 hours (cooling + flatline),
+    # then gets repaired/replaced and normal tiled signals resume.
+    DOWNTIME_S = 6 * 3600
+    downtime_rows = DOWNTIME_S // save_freq_s
 
-        # Temperatures cool down gradually (exponential decay to ambient over ~2h)
-        cool_tau = 2 * 3600 / save_freq_s  # 2-hour time constant in rows
+    if fail_end_row is not None and fail_end_row < total_rows:
+        down_end_row = min(fail_end_row + downtime_rows, total_rows)
+        dead_rows = down_end_row - fail_end_row
+
+        # ── Downtime: speed→0, flow→0, temps cool to ambient ──
+        for i, col in enumerate(_SIGNAL_COLS):
+            if col in ('shaft_speed_rads', 'pump_speed_rads',
+                        'flow_out_m3s', 'flow_in_m3s'):
+                # Immediate stop + sensor noise
+                signals[fail_end_row:down_end_row, i] = rng.normal(
+                    0, _TILE_NOISE_STD[col] * 0.5, size=dead_rows)
+            elif col in ('impeller_area_A', 'r_thrust', 'r_radial'):
+                # State freezes at failure value
+                signals[fail_end_row:down_end_row, i] = signals[fail_end_row - 1, i]
+
+        # Temperatures: exponential cooling to ambient over ~2h
+        cool_tau = 2 * 3600 / save_freq_s
         for col_name in ['thrust_bearing_K', 'radial_bearing_K', 'fluid_temp_K']:
             ci = _SIGNAL_COLS.index(col_name)
             hot_val = signals[fail_end_row - 1, ci]
             for r in range(dead_rows):
                 decay = (hot_val - TAMB) * np.exp(-r / cool_tau)
-                signals[fail_end_row + r, ci] = TAMB + decay + rng.normal(0, _TILE_NOISE_STD[col_name] * 0.3)
+                signals[fail_end_row + r, ci] = (
+                    TAMB + decay + rng.normal(0, _TILE_NOISE_STD[col_name] * 0.3))
 
-        labels[fail_end_row:] = 'FAILURE'
-        event_types[fail_end_row:] = 'post_failure'
-        print(f"    Post-failure flatline: {dead_rows} rows ({dead_rows * save_freq_s / 86400:.1f} days)",
+        labels[fail_end_row:down_end_row] = 'FAILURE'
+        event_types[fail_end_row:down_end_row] = 'post_failure'
+
+        print(f"    Post-failure downtime: {dead_rows} rows ({dead_rows * save_freq_s / 3600:.1f}h)",
               flush=True)
+
+        # ── Resume normal operations after downtime ──
+        # The tiled signals are already in place from step 1.
+        # Splice them back in with a smooth startup ramp (pump warming up).
+        if down_end_row < total_rows:
+            startup_rows = min(4 * CYCLE_TIME // save_freq_s, total_rows - down_end_row)
+            # Ramp speed and flow from 0 to normal over startup period
+            for i, col in enumerate(_SIGNAL_COLS):
+                if col in ('impeller_area_A', 'r_thrust', 'r_radial'):
+                    # Reset state to healthy values after repair
+                    tmpl = _build_template(save_freq_s)
+                    healthy_val = tmpl['template'].mean(axis=0)[i]
+                    signals[down_end_row:, i] = healthy_val
+                    continue
+
+                normal_vals = signals[down_end_row:down_end_row + startup_rows, i].copy()
+                for r in range(startup_rows):
+                    alpha = 0.5 * (1 - np.cos(np.pi * r / startup_rows))  # 0→1 smooth
+                    signals[down_end_row + r, i] = alpha * normal_vals[r]
+
+            labels[down_end_row:] = 'NORMAL'
+            event_types[down_end_row:down_end_row + startup_rows] = 'startup'
+            print(f"    Normal ops resumed at row {down_end_row} "
+                  f"(day {down_end_row * save_freq_s / 86400:.1f}), "
+                  f"startup ramp: {startup_rows} rows ({startup_rows * save_freq_s / 3600:.1f}h)",
+                  flush=True)
 
     # ── 4. Assemble DataFrame ──────────────────────────────────────────────────
     df = pd.DataFrame(signals, columns=_SIGNAL_COLS)
