@@ -491,8 +491,24 @@ def _build_template(save_freq_s: int = SAVE_FREQ) -> dict:
 
 def _tile_signals(total_rows: int, rng: np.random.Generator,
                   save_freq_s: int = SAVE_FREQ,
-                  noise_scale: float = 1.0) -> np.ndarray:
-    """Build a (total_rows, n_signals) array by tiling the steady-state template."""
+                  noise_scale: float = 1.0,
+                  ambient_var_K: float = 0.0,
+                  duty_cycle_var: float = 0.0) -> np.ndarray:
+    """
+    Build a (total_rows, n_signals) array by tiling the steady-state template.
+
+    Parameters
+    ----------
+    ambient_var_K : float
+        Amplitude of ambient temperature variation in Kelvin.
+        Adds daily cycle (±ambient_var_K) and seasonal drift (±ambient_var_K * 0.5).
+        0 = constant Tamb (original behaviour).
+    duty_cycle_var : float
+        Amplitude of duty cycle variation as fraction (0–1).
+        Scales speed/flow signals: heavier during day (6–18h), lighter at night,
+        ~30% reduction on weekends.
+        0 = constant duty (original behaviour).
+    """
     tmpl = _build_template(save_freq_s)
     startup = tmpl['startup']
     template = tmpl['template']
@@ -512,16 +528,66 @@ def _tile_signals(total_rows: int, rng: np.random.Generator,
         out[pos:pos + chunk] = template[:chunk]
         pos += chunk
 
-    # Add fresh noise to each row (except state columns with 0 noise)
+    # Add fresh noise to each row
     noise_stds = np.array([_TILE_NOISE_STD[c] for c in _SIGNAL_COLS])
     noise = rng.normal(0, 1, size=out.shape) * noise_stds * noise_scale
     out += noise
 
-    # Add slow random-walk drift on temperature columns (ambient drift)
+    # Slow random-walk drift on temperature columns
     for i, col in enumerate(_SIGNAL_COLS):
         if col.endswith('_K'):
             drift = np.cumsum(rng.normal(0, 0.001, size=total_rows))
             out[:, i] += drift
+
+    # ── Ambient temperature variation ─────────────────────────────────────
+    if ambient_var_K > 0:
+        time_s = np.arange(total_rows) * save_freq_s
+        time_h = time_s / 3600.0
+        time_days = time_h / 24.0
+
+        # Daily cycle: coolest at 4am, warmest at 3pm
+        daily = -ambient_var_K * np.cos(2 * np.pi * (time_h - 4) / 24)
+        # Seasonal cycle: coolest at day 0 (winter), warmest at day 182 (summer)
+        seasonal = -ambient_var_K * 0.5 * np.cos(2 * np.pi * time_days / 365)
+        # Combined ambient delta
+        tamb_delta = daily + seasonal
+
+        # Apply to all temperature columns
+        for i, col in enumerate(_SIGNAL_COLS):
+            if col.endswith('_K'):
+                out[:, i] += tamb_delta
+
+    # ── Variable duty cycle ───────────────────────────────────────────────
+    if duty_cycle_var > 0:
+        time_s = np.arange(total_rows) * save_freq_s
+        time_h = time_s / 3600.0
+        hour_of_day = time_h % 24
+        day_of_week = (time_h / 24).astype(int) % 7  # 0=Mon ... 6=Sun
+
+        # Day/night: full load 6am–6pm, reduced at night
+        day_night = np.where(
+            (hour_of_day >= 6) & (hour_of_day < 18),
+            1.0,
+            1.0 - 0.6 * duty_cycle_var  # night reduction
+        )
+        # Smooth transitions at dawn (5–7am) and dusk (17–19pm)
+        dawn = np.clip((hour_of_day - 5) / 2, 0, 1)
+        dusk = np.clip((19 - hour_of_day) / 2, 0, 1)
+        day_night = 1.0 - (1.0 - day_night) * (1 - dawn * dusk)
+
+        # Weekend: 30% reduction on Sat/Sun
+        weekend = np.where(day_of_week >= 5, 1.0 - 0.3 * duty_cycle_var, 1.0)
+
+        duty_scale = day_night * weekend
+
+        # Apply to speed and flow columns (not temperatures — those respond indirectly)
+        speed_flow_cols = ['shaft_speed_rads', 'pump_speed_rads',
+                           'flow_out_m3s', 'flow_in_m3s']
+        template_means = template.mean(axis=0)
+        for i, col in enumerate(_SIGNAL_COLS):
+            if col in speed_flow_cols:
+                mean_val = template_means[i]
+                out[:, i] = mean_val + (out[:, i] - mean_val) * duty_scale
 
     return out
 
@@ -564,10 +630,17 @@ def generate_long_series(
     save_freq_s: int = SAVE_FREQ,
     failure_type: str | None = None,
     failure_start_day: float | None = None,
+    failure_severity: float = 1.0,
     decoy_types: list[str] | None = None,
     decoy_freq_per_day: float = 0.0,
     decoy_duration_h: float = 4.0,
+    ambient_var_K: float = 0.0,
+    duty_cycle_var: float = 0.0,
     seed: int = 42,
+    noise_scale: float = 1.0,
+    decoy_cache: dict | None = None,
+    v_offset: float = 0.0,
+    p_offset: float = 0.0,
 ) -> pd.DataFrame:
     """
     Generate a long pump time series (days to years).
@@ -578,11 +651,22 @@ def generate_long_series(
     duration_days : float  Total duration in days.
     save_freq_s : int      Seconds between saved rows.
     failure_type : str     'bearing', 'impeller', 'radial', or None for healthy.
-    failure_start_day : float  Day when failure degradation begins (None = random 70-90%).
+    failure_start_day : float  Day when failure begins (None = random 70-90%).
+    failure_severity : float   Wear rate multiplier (0.5 = slow/10h, 1.0 = normal/6h,
+                               2.0 = fast/3h). 0 = randomize per event (0.5–2.0).
     decoy_types : list     Subset of ['highload_step','highload_ramp','bp_step','bp_ramp'].
     decoy_freq_per_day : float  Average decoy events per day (Poisson rate).
     decoy_duration_h : float    Duration of each decoy episode in hours.
+    ambient_var_K : float  Ambient temperature variation amplitude in K.
+                           0 = constant (original). 5 = moderate daily/seasonal swing.
+    duty_cycle_var : float Duty cycle variation amplitude (0–1).
+                           0 = constant load. 0.5 = moderate day/night + weekend effect.
     seed : int             Random seed for reproducibility.
+    noise_scale : float    Multiplier for measurement noise (1.0 = default).
+    decoy_cache : dict     Pre-built decoy arrays keyed by decoy name. If provided,
+                           skips per-call decoy simulation.
+    v_offset : float       Voltage offset from nominal — shifts shaft speed proportionally.
+    p_offset : float       Pressure offset from nominal — shifts flow columns proportionally.
 
     Returns
     -------
@@ -595,7 +679,21 @@ def generate_long_series(
     print(f"  Generating {name}: {duration_days:.0f} days, {total_rows} rows", flush=True)
 
     # ── 1. Tile steady-state template ──────────────────────────────────────────
-    signals = _tile_signals(total_rows, rng, save_freq_s)
+    signals = _tile_signals(total_rows, rng, save_freq_s,
+                            noise_scale=noise_scale,
+                            ambient_var_K=ambient_var_K,
+                            duty_cycle_var=duty_cycle_var)
+
+    # ── 1b. Apply device-specific offsets ─────────────────────────────────────
+    if v_offset != 0.0:
+        for i, col in enumerate(_SIGNAL_COLS):
+            if col in ('shaft_speed_rads', 'pump_speed_rads'):
+                signals[:, i] += v_offset * 0.8
+    if p_offset != 0.0:
+        p_frac = p_offset / PDISCH_NOM if PDISCH_NOM != 0 else 0.0
+        for i, col in enumerate(_SIGNAL_COLS):
+            if col in ('flow_out_m3s', 'flow_in_m3s'):
+                signals[:, i] += signals[:, i] * p_frac
     time_s = np.arange(total_rows) * save_freq_s
     time_h = time_s / 3600.0
 
@@ -611,17 +709,18 @@ def generate_long_series(
         n_decoys = rng.poisson(decoy_freq_per_day * duration_days)
         decoy_times_s = np.sort(rng.uniform(0, total_s, size=n_decoys))
 
-        # Pre-simulate each decoy type once (full 6h template)
-        decoy_cache = {}
-        for dt_name in decoy_types:
-            if dt_name in _DECOY_LOAD_FNS and dt_name not in decoy_cache:
-                print(f"    Simulating decoy template: {dt_name}...", flush=True)
-                ddf = run_progpy(_DECOY_LOAD_FNS[dt_name], WEAR_X0_HEALTHY, faulty=False)
-                change_row = CHANGE_AT_S // save_freq_s
-                decoy_raw = ddf[_SIGNAL_COLS].values[change_row:]
-                # Store deviation from the tiled baseline at those rows
-                # so we can scale amplitude per event
-                decoy_cache[dt_name] = decoy_raw
+        # Pre-simulate each decoy type once (full 6h template), or use provided cache
+        if decoy_cache is None:
+            decoy_cache = {}
+            for dt_name in decoy_types:
+                if dt_name in _DECOY_LOAD_FNS and dt_name not in decoy_cache:
+                    print(f"    Simulating decoy template: {dt_name}...", flush=True)
+                    ddf = run_progpy(_DECOY_LOAD_FNS[dt_name], WEAR_X0_HEALTHY, faulty=False)
+                    change_row = CHANGE_AT_S // save_freq_s
+                    decoy_raw = ddf[_SIGNAL_COLS].values[change_row:]
+                    # Store deviation from the tiled baseline at those rows
+                    # so we can scale amplitude per event
+                    decoy_cache[dt_name] = decoy_raw
 
         # Get baseline values (mean of steady-state template) for amplitude scaling
         tmpl_baseline = _build_template(save_freq_s)['template'].mean(axis=0)
@@ -678,12 +777,21 @@ def generate_long_series(
         if failure_start_day is None:
             failure_start_day = duration_days * rng.uniform(0.7, 0.9)
 
+        # Variable failure severity: scale wear rates
+        if failure_severity == 0:
+            sev = rng.uniform(0.5, 2.0)  # randomize
+        else:
+            sev = failure_severity
+        scaled_wear = {}
+        for k, v in _FAILURE_WEAR[failure_type].items():
+            scaled_wear[k] = v * sev
+
         fail_start_s = failure_start_day * 86400
         fail_start_row = int(fail_start_s / save_freq_s)
 
-        print(f"    Simulating {failure_type} failure (starts day {failure_start_day:.1f})...",
-              flush=True)
-        fdf = run_progpy(base_load, _FAILURE_WEAR[failure_type], faulty=True)
+        print(f"    Simulating {failure_type} failure (day {failure_start_day:.1f}, "
+              f"severity {sev:.2f}x)...", flush=True)
+        fdf = run_progpy(base_load, scaled_wear, faulty=True)
         fail_signals = fdf[_SIGNAL_COLS].values
         n_fail = min(len(fail_signals), total_rows - fail_start_row)
 
@@ -785,6 +893,9 @@ def generate_dataset(
     save_freq_s: int = SAVE_FREQ,
     decoy_freq_per_day: float = 2.0,
     decoy_types: list[str] | None = None,
+    failure_severity: float = 1.0,
+    ambient_var_K: float = 0.0,
+    duty_cycle_var: float = 0.0,
     seed: int = 42,
     output_dir: str = 'sample_data',
 ) -> dict[str, pd.DataFrame]:
@@ -798,6 +909,9 @@ def generate_dataset(
     save_freq_s : int            Seconds between rows.
     decoy_freq_per_day : float   Average decoy events per day in each series.
     decoy_types : list           Decoy types to use.
+    failure_severity : float     Wear rate multiplier (0 = random 0.5–2.0 per event).
+    ambient_var_K : float        Ambient temperature variation (K). 0 = off, 5 = moderate.
+    duty_cycle_var : float       Duty cycle variation (0–1). 0 = off, 0.5 = moderate.
     seed : int                   Base seed (each series gets seed + offset).
     output_dir : str             Directory for output files.
 
@@ -826,20 +940,19 @@ def generate_dataset(
             duration_days=duration_days,
             save_freq_s=save_freq_s,
             failure_type=fail_type,
+            failure_severity=failure_severity,
             decoy_types=decoy_types,
             decoy_freq_per_day=decoy_freq_per_day,
+            ambient_var_K=ambient_var_K,
+            duty_cycle_var=duty_cycle_var,
             seed=seed + i,
         )
         df['scenario_id'] = i
 
-        # Save as parquet for large files, CSV for small
-        out_path = f"{output_dir}/{name}"
-        if len(df) > 50000:
-            df.to_parquet(f"{out_path}.parquet", index=False)
-            print(f"    → {out_path}.parquet ({len(df)} rows)")
-        else:
-            df.to_csv(f"{out_path}.csv", index=False)
-            print(f"    → {out_path}.csv ({len(df)} rows)")
+        # Always save long series as parquet (compact + fast to load)
+        out_path = f"{output_dir}/{name}.parquet"
+        df.to_parquet(out_path, index=False)
+        print(f"    → {out_path} ({len(df)} rows)")
 
         meta_rows.append({
             'scenario_id': i,
