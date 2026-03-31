@@ -67,6 +67,7 @@ uv run papermill sample_visualiser.ipynb output.ipynb \
 | `run_long_series` | true | Generate year-long time series (4 series) |
 | `downsample` | 50 | Downsample for long series plots (1 = full, 50 = fast) |
 | `failure_severity` | 0 | Wear rate multiplier. 0 = random 0.5–2.0x, 1.0 = normal ~6h, 2.0 = fast ~3h |
+| `maintenance_freq_per_month` | 1.0 | Planned maintenance shutdowns per month. Looks like failure (speed→0) but labelled NORMAL. 0 = none |
 | `ambient_var_K` | 5.0 | Ambient temp variation (K). Daily ±5K cycle + seasonal ±2.5K. 0 = constant |
 | `duty_cycle_var` | 0.5 | Duty cycle variation (0–1). Day/night + weekend load patterns. 0 = constant |
 
@@ -234,7 +235,7 @@ fleet_data/
 |--------|--------|-------------|
 | `label` | `NORMAL`, `PRE_FAILURE`, `FAILURE` | Ground truth |
 | `time_to_failure_s` | float | Seconds until failure (-1 if healthy) |
-| `event_type` | `normal`, `decoy_*`, `failure_*`, `post_failure`, `startup` | Current event |
+| `event_type` | `normal`, `decoy_*`, `failure_*`, `post_failure`, `startup`, `maintenance` | Current event |
 | `scenario_id` / `device_id` | int / str | Series identifier |
 
 ## Failure modes
