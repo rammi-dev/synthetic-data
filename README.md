@@ -1,6 +1,12 @@
 # Synthetic Pump Failure Data
 
-Synthetic time-series data for centrifugal pump failure detection, generated using NASA's [progpy](https://nasa.github.io/progpy/) CentrifugalPump model.
+Synthetic time-series data for **load-testing and benchmarking ML pipelines** from a performance perspective. The data simulates centrifugal pump sensor readings using NASA's [progpy](https://nasa.github.io/progpy/) CentrifugalPump model.
+
+**This is not production training data.** The purpose is to generate realistic-looking, correctly-structured time series at scale (up to 200GB+) so you can:
+- Stress-test data ingestion, feature engineering, and model training pipelines
+- Benchmark throughput and resource usage under realistic data volumes
+- Validate that pipeline code handles failure labels, decoy events, multi-device partitioning, and mixed event types correctly
+- Develop and debug ML workflows before real sensor data is available
 
 Two modes of operation:
 1. **Sample notebook** — interactive exploration of failure signatures (4 series, ~150MB)
