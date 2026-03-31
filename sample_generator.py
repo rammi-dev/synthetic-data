@@ -634,6 +634,8 @@ def generate_long_series(
     decoy_types: list[str] | None = None,
     decoy_freq_per_day: float = 0.0,
     decoy_duration_h: float = 4.0,
+    maintenance_freq_per_month: float = 0.0,
+    maintenance_duration_h: float = 4.0,
     ambient_var_K: float = 0.0,
     duty_cycle_var: float = 0.0,
     seed: int = 42,
@@ -657,6 +659,10 @@ def generate_long_series(
     decoy_types : list     Subset of ['highload_step','highload_ramp','bp_step','bp_ramp'].
     decoy_freq_per_day : float  Average decoy events per day (Poisson rate).
     decoy_duration_h : float    Duration of each decoy episode in hours.
+    maintenance_freq_per_month : float  Planned maintenance shutdowns per month.
+                               0 = none. 1 = ~monthly. Looks like a failure (speed→0,
+                               temps cool) but is labelled NORMAL.
+    maintenance_duration_h : float  Duration of each maintenance window in hours (2–8).
     ambient_var_K : float  Ambient temperature variation amplitude in K.
                            0 = constant (original). 5 = moderate daily/seasonal swing.
     duty_cycle_var : float Duty cycle variation amplitude (0–1).
@@ -702,6 +708,92 @@ def generate_long_series(
     event_types = np.full(total_rows, 'normal', dtype=object)
     ttf = np.full(total_rows, -1.0)
 
+    # ── 1c. Planned maintenance shutdowns (hard negative for failure) ─────
+    # Looks like a failure: speed→0, flow→0, temps cool down — but is NORMAL.
+    # The ramp-down and ramp-up are smoother than a failure (controlled shutdown).
+    used_windows = []  # shared between maintenance and decoys to prevent overlap
+
+    if maintenance_freq_per_month > 0:
+        n_maint = rng.poisson(maintenance_freq_per_month * duration_days / 30)
+        maint_times_s = np.sort(rng.uniform(0, total_s, size=n_maint))
+
+        maint_count = 0
+        for t_s in maint_times_s:
+            # Random duration: maintenance_duration_h ± 50%
+            this_dur_h = rng.uniform(
+                maintenance_duration_h * 0.5,
+                maintenance_duration_h * 1.5
+            )
+            this_dur_rows = int(this_dur_h * 3600 / save_freq_s)
+            ramp_rows = min(30, this_dur_rows // 4)  # ~30 min ramp each side
+
+            start_row = int(t_s / save_freq_s)
+            end_row = start_row + this_dur_rows
+            if end_row >= total_rows:
+                continue
+
+            # Check overlap
+            overlap = any(not (end_row <= ws or start_row >= we)
+                          for ws, we in used_windows)
+            if overlap:
+                continue
+
+            # Save pre-maintenance values for ramp targets
+            pre_vals = signals[start_row].copy()
+
+            # ── Ramp down (controlled shutdown) ──
+            for r in range(ramp_rows):
+                alpha = 1.0 - 0.5 * (1 - np.cos(np.pi * r / ramp_rows))  # 1→0 smooth
+                for i, col in enumerate(_SIGNAL_COLS):
+                    if col in ('shaft_speed_rads', 'pump_speed_rads',
+                               'flow_out_m3s', 'flow_in_m3s'):
+                        signals[start_row + r, i] = pre_vals[i] * alpha
+                    elif col.endswith('_K'):
+                        # Temps start cooling during ramp
+                        signals[start_row + r, i] = TAMB + (pre_vals[i] - TAMB) * alpha
+
+            # ── Flat shutdown (speed=0, temps at ambient + noise) ──
+            flat_start = start_row + ramp_rows
+            flat_end = end_row - ramp_rows
+            cool_tau = 2 * 3600 / save_freq_s
+            for i, col in enumerate(_SIGNAL_COLS):
+                n_flat = max(0, flat_end - flat_start)
+                if col in ('shaft_speed_rads', 'pump_speed_rads',
+                           'flow_out_m3s', 'flow_in_m3s'):
+                    signals[flat_start:flat_end, i] = rng.normal(
+                        0, _TILE_NOISE_STD[col] * 0.3, size=n_flat)
+                elif col.endswith('_K'):
+                    # Exponential cooling to ambient
+                    hot_val = signals[flat_start - 1, i] if flat_start > 0 else TAMB
+                    for r in range(n_flat):
+                        decay = (hot_val - TAMB) * np.exp(-r / cool_tau)
+                        signals[flat_start + r, i] = (
+                            TAMB + decay + rng.normal(0, _TILE_NOISE_STD[col] * 0.3))
+                elif col in ('impeller_area_A', 'r_thrust', 'r_radial'):
+                    pass  # state unchanged during maintenance
+
+            # ── Ramp up (controlled restart) ──
+            # Restore to the tiled values that were already there
+            ramp_up_start = max(flat_start, flat_end)
+            post_vals = signals[end_row].copy() if end_row < total_rows else pre_vals
+            for r in range(min(ramp_rows, total_rows - ramp_up_start)):
+                alpha = 0.5 * (1 - np.cos(np.pi * r / ramp_rows))  # 0→1 smooth
+                row_idx = ramp_up_start + r
+                for i, col in enumerate(_SIGNAL_COLS):
+                    if col in ('shaft_speed_rads', 'pump_speed_rads',
+                               'flow_out_m3s', 'flow_in_m3s'):
+                        signals[row_idx, i] = post_vals[i] * alpha
+                    elif col.endswith('_K'):
+                        signals[row_idx, i] = TAMB + (post_vals[i] - TAMB) * alpha
+
+            event_types[start_row:end_row] = 'maintenance'
+            # Labels stay NORMAL — this is planned, not a failure
+            used_windows.append((start_row, end_row))
+            maint_count += 1
+
+        if maint_count > 0:
+            print(f"    Spliced {maint_count} planned maintenance windows", flush=True)
+
     # ── 2. Schedule and splice decoy events ────────────────────────────────────
     # Each decoy gets random duration (1–6h) and amplitude (0.4–1.6× the
     # template's deviation from baseline), so no two decoys look the same.
@@ -724,8 +816,6 @@ def generate_long_series(
 
         # Get baseline values (mean of steady-state template) for amplitude scaling
         tmpl_baseline = _build_template(save_freq_s)['template'].mean(axis=0)
-
-        used_windows = []
 
         for t_s in decoy_times_s:
             # Random duration: 1–6 hours
@@ -768,9 +858,6 @@ def generate_long_series(
 
         print(f"    Spliced {len(used_windows)} decoy events (varied amplitude & duration)",
               flush=True)
-    else:
-        used_windows = []
-
     # ── 3. Splice failure episode ──────────────────────────────────────────────
     fail_end_row = None
     if failure_type and failure_type in _FAILURE_WEAR:
@@ -894,6 +981,7 @@ def generate_dataset(
     decoy_freq_per_day: float = 2.0,
     decoy_types: list[str] | None = None,
     failure_severity: float = 1.0,
+    maintenance_freq_per_month: float = 1.0,
     ambient_var_K: float = 0.0,
     duty_cycle_var: float = 0.0,
     seed: int = 42,
@@ -910,6 +998,7 @@ def generate_dataset(
     decoy_freq_per_day : float   Average decoy events per day in each series.
     decoy_types : list           Decoy types to use.
     failure_severity : float     Wear rate multiplier (0 = random 0.5–2.0 per event).
+    maintenance_freq_per_month : float  Planned maintenance shutdowns per month. 0 = none.
     ambient_var_K : float        Ambient temperature variation (K). 0 = off, 5 = moderate.
     duty_cycle_var : float       Duty cycle variation (0–1). 0 = off, 0.5 = moderate.
     seed : int                   Base seed (each series gets seed + offset).
@@ -943,6 +1032,7 @@ def generate_dataset(
             failure_severity=failure_severity,
             decoy_types=decoy_types,
             decoy_freq_per_day=decoy_freq_per_day,
+            maintenance_freq_per_month=maintenance_freq_per_month,
             ambient_var_K=ambient_var_K,
             duty_cycle_var=duty_cycle_var,
             seed=seed + i,
