@@ -92,6 +92,36 @@ uv run python fleet_generator.py \
 
 Estimated ~85 minutes on 32 cores. **Resumable** — if interrupted, rerun the same command and it skips completed devices.
 
+### Testing before full run
+
+```bash
+# Smoke test — 5 devices, 1 day each (~10s)
+uv run python fleet_generator.py \
+  --num-devices 5 --duration-days 1 --output-dir test_smoke
+
+# All failure types present, short time — verify diversity (~30s)
+# 10 devices guarantees at least 1 of each type (40/20/20/20 split)
+uv run python fleet_generator.py \
+  --num-devices 10 --duration-days 7 --output-dir test_diversity
+
+# Few devices, full year — verify long series quality (~2min)
+uv run python fleet_generator.py \
+  --num-devices 4 --duration-days 365 --output-dir test_full_year
+
+# Medium scale — 100 devices, 30 days (~3min)
+uv run python fleet_generator.py \
+  --num-devices 100 --duration-days 30 --output-dir test_medium
+```
+
+After each test, inspect the manifest to confirm device variety:
+```bash
+# Check failure type distribution
+cut -d',' -f4 test_diversity/device_manifest.csv | sort | uniq -c
+
+# Check parameter ranges
+head -3 test_diversity/device_manifest.csv | column -t -s','
+```
+
 ### Fleet parameters
 
 | Parameter | Default | Description |
@@ -240,20 +270,44 @@ A simple threshold on any single signal will false-alarm on decoys:
 
 ## 3. GCP Dataproc Serverless (cloud scale)
 
-`dataproc_submit.sh` packages the code and submits a PySpark batch job to Dataproc Serverless. Each Spark executor generates a subset of devices in parallel, writing parquet directly to GCS.
+Uses a **custom container image** with progpy + dependencies baked in, submitted as a PySpark batch to Dataproc Serverless.
 
 ### Prerequisites
 
 ```bash
 gcloud auth login
 gcloud config set project YOUR_PROJECT
-gsutil mb -l us-central1 gs://YOUR_PROJECT-pump-data  # create bucket
+gcloud services enable dataproc.googleapis.com artifactregistry.googleapis.com
 ```
 
-### Quick test (100 devices, 7 days)
+Docker must be available locally (for building the image).
+
+### Testing before full run
 
 ```bash
-NUM_DEVICES=100 DURATION_DAYS=7 NUM_EXECUTORS=4 ./dataproc_submit.sh
+# Smoke test — 5 devices, 1 day, 2 executors (~2min including image build)
+NUM_DEVICES=5 DURATION_DAYS=1 NUM_EXECUTORS=2 ./dataproc_submit.sh
+
+# All failure types, short time — verify diversity
+NUM_DEVICES=10 DURATION_DAYS=7 NUM_EXECUTORS=4 ./dataproc_submit.sh
+
+# Few devices, full year — verify long series quality
+NUM_DEVICES=4 DURATION_DAYS=365 NUM_EXECUTORS=4 ./dataproc_submit.sh
+
+# Medium scale — 100 devices, 30 days
+NUM_DEVICES=100 DURATION_DAYS=30 NUM_EXECUTORS=8 ./dataproc_submit.sh
+```
+
+After each test, check the output:
+```bash
+# List generated files
+gsutil ls gs://BUCKET/fleet_output/BATCH_ID/devices/ | head -10
+
+# Check total size
+gsutil du -sh gs://BUCKET/fleet_output/BATCH_ID/
+
+# Download manifest to inspect device variety
+gsutil cat gs://BUCKET/fleet_output/BATCH_ID/device_manifest/*.csv | head -5
 ```
 
 ### Full 200GB generation (6000 devices, 365 days)
@@ -270,9 +324,25 @@ BUCKET=my-pump-data \
 NUM_DEVICES=6000 \
 DURATION_DAYS=365 \
 NUM_EXECUTORS=16 \
-REGION=us-central1 \
 ./dataproc_submit.sh
 ```
+
+### Reuse existing image (skip rebuild)
+
+```bash
+SKIP_BUILD=1 ./dataproc_submit.sh
+SKIP_BUILD=1 NUM_DEVICES=100 DURATION_DAYS=7 ./dataproc_submit.sh
+```
+
+### How it works
+
+1. **Builds a custom Spark container** (`Dockerfile.dataproc`) based on `gcr.io/dataproc-images/dataproc_serverless_pyspark:2.2-debian12` with progpy, numpy, pandas, pyarrow, etc. pre-installed
+2. **Pushes** the image to Artifact Registry (`${REGION}-docker.pkg.dev/${PROJECT}/pump-fleet/spark:latest`)
+3. **Uploads** the PySpark driver script to GCS
+4. **Submits** a Dataproc Serverless batch with `--container-image`
+5. The **driver** samples all device configs and distributes them as an RDD (~50 devices per partition)
+6. Each **executor** calls `_worker_init()` once (builds progpy template + decoy cache), then generates its assigned devices, writing parquet directly to GCS
+7. Dynamic allocation scales up to 2× requested executors if available
 
 ### Environment variables
 
@@ -280,7 +350,7 @@ REGION=us-central1 \
 |----------|---------|-------------|
 | `PROJECT` | gcloud default | GCP project ID |
 | `REGION` | us-central1 | Dataproc region |
-| `BUCKET` | `${PROJECT}-pump-data` | GCS bucket for code, deps, output |
+| `BUCKET` | `${PROJECT}-pump-data` | GCS bucket for output |
 | `NUM_DEVICES` | 6000 | Number of pump devices |
 | `DURATION_DAYS` | 365 | Days per device |
 | `SAVE_FREQ_S` | 60 | Seconds between rows |
@@ -292,7 +362,9 @@ REGION=us-central1 \
 | `DRIVER_MEMORY` | 16g | Driver memory |
 | `SUBNET` | default | VPC subnet |
 | `SERVICE_ACCOUNT` | — | SA for the batch (optional) |
-| `BATCH_ID` | auto-generated | Batch identifier |
+| `AR_REPO` | pump-fleet | Artifact Registry repo name |
+| `IMAGE_TAG` | latest | Container image tag |
+| `SKIP_BUILD` | 0 | Set to 1 to skip docker build/push |
 
 ### Monitoring
 
@@ -302,6 +374,9 @@ gcloud dataproc batches wait pump-fleet-20260331-120000 --region=us-central1
 
 # Check status
 gcloud dataproc batches describe pump-fleet-20260331-120000 --region=us-central1
+
+# Check output size
+gsutil du -sh gs://BUCKET/fleet_output/pump-fleet-20260331-120000/
 
 # Cancel
 gcloud dataproc batches cancel pump-fleet-20260331-120000 --region=us-central1
@@ -319,18 +394,6 @@ gs://BUCKET/fleet_output/BATCH_ID/
     device_005999.parquet
   generation_results/         # CSV with per-device status + timing
 ```
-
-### How it works
-
-1. `dataproc_submit.sh` uploads code + packaged dependencies to GCS
-2. Submits `spark_fleet_driver.py` as a Dataproc Serverless PySpark batch
-3. The driver samples all device configs on the Spark driver node
-4. Distributes device configs across executors as an RDD (~50 devices per partition)
-5. Each executor runs `_worker_init()` once (builds progpy template + decoy cache)
-6. Each executor generates its devices sequentially, writing parquet to GCS
-7. Driver collects results and writes manifest + summary
-
-Dynamic allocation is enabled — Spark can scale up to 2× the requested executors if resources are available.
 
 ### Estimated cost
 

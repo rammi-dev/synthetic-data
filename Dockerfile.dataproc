@@ -1,0 +1,38 @@
+# Custom container for Dataproc Serverless
+# Based on the official Spark image with progpy + dependencies added
+#
+# Build:
+#   docker build -f Dockerfile.dataproc -t gcr.io/${PROJECT}/pump-fleet-spark:latest .
+#   docker push gcr.io/${PROJECT}/pump-fleet-spark:latest
+#
+# Or with Artifact Registry:
+#   docker build -f Dockerfile.dataproc -t ${REGION}-docker.pkg.dev/${PROJECT}/pump-fleet/spark:latest .
+#   docker push ${REGION}-docker.pkg.dev/${PROJECT}/pump-fleet/spark:latest
+
+# Dataproc Serverless requires this specific base image
+# See: https://cloud.google.com/dataproc-serverless/docs/concepts/custom-containers
+FROM gcr.io/dataproc-images/dataproc_serverless_pyspark:2.2-debian12
+
+# Install project dependencies into the Spark Python environment
+USER root
+
+RUN pip install --no-cache-dir \
+    progpy==1.7.1 \
+    numpy>=2.0 \
+    pandas>=2.0 \
+    pyarrow>=15.0 \
+    scipy>=1.12 \
+    chaospy \
+    numpoly \
+    filterpy \
+    fastdtw \
+    tqdm
+
+# Copy generator code
+COPY sample_generator.py /opt/pump-fleet/sample_generator.py
+COPY fleet_generator.py /opt/pump-fleet/fleet_generator.py
+
+# Make code importable from Spark executors
+ENV PYTHONPATH="/opt/pump-fleet:${PYTHONPATH}"
+
+USER spark
