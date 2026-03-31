@@ -383,22 +383,445 @@ def build_scenarios() -> list[Scenario]:
 
 def run_all(scenarios: list[Scenario]) -> dict[str, pd.DataFrame]:
     results = {}
-    for sc in scenarios:
+    scenario_meta = []
+
+    for sc_id, sc in enumerate(scenarios):
         print(f"  Simulating: {sc.name:<35}", end="", flush=True)
         df = run_progpy(sc.load_fn, sc.wear_x0, sc.faulty)
         df = make_label(df, sc.faulty)
-        df["scenario"]    = sc.name
-        df["kind"]        = sc.kind
-        df["description"] = sc.description
+        df["scenario_id"] = sc_id
 
         # Derived column (flow gap — useful for analysis)
         if "flow_in_m3s" in df.columns and "flow_out_m3s" in df.columns:
             df["flow_gap_m3s"] = (df["flow_in_m3s"] - df["flow_out_m3s"]).clip(lower=0)
 
-        # Save CSV
+        # Save per-scenario CSV (data only, no denormalized text columns)
         df.to_csv(f"sample_data/{sc.name}.csv", index=False)
+
+        scenario_meta.append({
+            "scenario_id":  sc_id,
+            "scenario":     sc.name,
+            "group":        sc.group,
+            "kind":         sc.kind,
+            "faulty":       sc.faulty,
+            "description":  sc.description,
+        })
         results[sc.name] = df
         print(f" {len(df)} rows  [{df['label'].value_counts().to_dict()}]")
+
+    # Save scenario lookup table
+    meta_df = pd.DataFrame(scenario_meta)
+    meta_df.to_csv("sample_data/scenarios.csv", index=False)
+    print(f"\n  Scenario lookup table: sample_data/scenarios.csv ({len(meta_df)} rows)")
+
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Long time-series generator (days → year scale)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Strategy: run progpy ONCE for 6h to get a steady-state template (1 voltage
+# cycle = 1h at 60s save_freq = 60 rows). Tile that template for the full
+# duration with fresh noise. Splice in failure episodes and decoy events.
+# Total progpy calls: ~8 regardless of duration.
+
+# Signal columns that get tiled / spliced (excludes metadata)
+_SIGNAL_COLS = [
+    'shaft_speed_rads', 'flow_out_m3s', 'thrust_bearing_K',
+    'radial_bearing_K', 'fluid_temp_K', 'flow_in_m3s',
+    'pump_speed_rads', 'impeller_area_A', 'r_thrust', 'r_radial',
+]
+
+# Noise std per signal for tiling (derived from MEASUREMENT_NOISE mapping)
+_TILE_NOISE_STD = {
+    'shaft_speed_rads': 0.3,
+    'flow_out_m3s':     5e-5,
+    'thrust_bearing_K': 0.2,
+    'radial_bearing_K': 0.2,
+    'fluid_temp_K':     0.1,
+    'flow_in_m3s':      5e-5,
+    'pump_speed_rads':  0.3,
+    'impeller_area_A':  0.0,
+    'r_thrust':         0.0,
+    'r_radial':         0.0,
+}
+
+# Map failure type → wear_x0 dict
+_FAILURE_WEAR = {
+    'bearing':  WEAR_X0_BEARING,
+    'impeller': WEAR_X0_IMPELLER,
+    'radial':   WEAR_X0_SEAL,     # uses wRadial
+}
+
+# Available decoy types → load functions
+_DECOY_LOAD_FNS = {
+    'highload_step': highload_step_load,
+    'highload_ramp': highload_ramp_load,
+    'bp_step':       bp_step_load,
+    'bp_ramp':       bp_ramp_load,
+}
+
+# Cache for the steady-state template
+_TEMPLATE_CACHE: dict | None = None
+
+
+def _build_template(save_freq_s: int = SAVE_FREQ) -> dict:
+    """Run a 6h healthy sim, return startup transient + 1-cycle template."""
+    global _TEMPLATE_CACHE
+    if _TEMPLATE_CACHE is not None and _TEMPLATE_CACHE['save_freq_s'] == save_freq_s:
+        return _TEMPLATE_CACHE
+
+    print("  Building steady-state template (one-time progpy run)...", flush=True)
+    df = run_progpy(base_load, WEAR_X0_HEALTHY, faulty=False)
+
+    cycle_rows = CYCLE_TIME // save_freq_s  # rows per voltage cycle
+    # Startup = first 4 cycles; template = last cycle (steady state)
+    startup = df.iloc[:4 * cycle_rows].copy()
+    template = df.iloc[-cycle_rows:].copy()
+
+    _TEMPLATE_CACHE = {
+        'startup':     startup[_SIGNAL_COLS].values,
+        'template':    template[_SIGNAL_COLS].values,
+        'cycle_rows':  cycle_rows,
+        'save_freq_s': save_freq_s,
+    }
+    return _TEMPLATE_CACHE
+
+
+def _tile_signals(total_rows: int, rng: np.random.Generator,
+                  save_freq_s: int = SAVE_FREQ,
+                  noise_scale: float = 1.0) -> np.ndarray:
+    """Build a (total_rows, n_signals) array by tiling the steady-state template."""
+    tmpl = _build_template(save_freq_s)
+    startup = tmpl['startup']
+    template = tmpl['template']
+    cycle_rows = tmpl['cycle_rows']
+    n_signals = template.shape[1]
+
+    out = np.empty((total_rows, n_signals), dtype=np.float64)
+
+    # Fill startup
+    n_startup = min(len(startup), total_rows)
+    out[:n_startup] = startup[:n_startup]
+
+    # Tile remaining
+    pos = n_startup
+    while pos < total_rows:
+        chunk = min(cycle_rows, total_rows - pos)
+        out[pos:pos + chunk] = template[:chunk]
+        pos += chunk
+
+    # Add fresh noise to each row (except state columns with 0 noise)
+    noise_stds = np.array([_TILE_NOISE_STD[c] for c in _SIGNAL_COLS])
+    noise = rng.normal(0, 1, size=out.shape) * noise_stds * noise_scale
+    out += noise
+
+    # Add slow random-walk drift on temperature columns (ambient drift)
+    for i, col in enumerate(_SIGNAL_COLS):
+        if col.endswith('_K'):
+            drift = np.cumsum(rng.normal(0, 0.001, size=total_rows))
+            out[:, i] += drift
+
+    return out
+
+
+def _splice_window(series: np.ndarray, splice_data: np.ndarray,
+                   start_row: int, blend_rows: int = 5) -> None:
+    """Overwrite series[start_row:start_row+len(splice)] with crossfade blend."""
+    n = min(len(splice_data), len(series) - start_row)
+    if n <= 0:
+        return
+    end_row = start_row + n
+
+    # Blend entry
+    b = min(blend_rows, n)
+    for i in range(b):
+        alpha = i / b
+        series[start_row + i] = (1 - alpha) * series[start_row + i] + alpha * splice_data[i]
+
+    # Bulk copy middle
+    if b < n:
+        series[start_row + b:end_row] = splice_data[b:n]
+
+    # Blend exit (last few rows back to what follows)
+    if end_row < len(series) and b < n:
+        for i in range(min(blend_rows, len(series) - end_row)):
+            alpha = i / blend_rows
+            series[end_row + i] = alpha * series[end_row + i] + (1 - alpha) * splice_data[-1]
+
+
+def generate_long_series(
+    name: str,
+    duration_days: float = 365.0,
+    save_freq_s: int = SAVE_FREQ,
+    failure_type: str | None = None,
+    failure_start_day: float | None = None,
+    decoy_types: list[str] | None = None,
+    decoy_freq_per_day: float = 0.0,
+    decoy_duration_h: float = 4.0,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """
+    Generate a long pump time series (days to years).
+
+    Parameters
+    ----------
+    name : str             Series identifier.
+    duration_days : float  Total duration in days.
+    save_freq_s : int      Seconds between saved rows.
+    failure_type : str     'bearing', 'impeller', 'radial', or None for healthy.
+    failure_start_day : float  Day when failure degradation begins (None = random 70-90%).
+    decoy_types : list     Subset of ['highload_step','highload_ramp','bp_step','bp_ramp'].
+    decoy_freq_per_day : float  Average decoy events per day (Poisson rate).
+    decoy_duration_h : float    Duration of each decoy episode in hours.
+    seed : int             Random seed for reproducibility.
+
+    Returns
+    -------
+    pd.DataFrame with signal columns, time_s, time_h, label, scenario_id, event_type.
+    """
+    rng = np.random.default_rng(seed)
+    total_s = duration_days * 86400
+    total_rows = int(total_s / save_freq_s) + 1
+
+    print(f"  Generating {name}: {duration_days:.0f} days, {total_rows} rows", flush=True)
+
+    # ── 1. Tile steady-state template ──────────────────────────────────────────
+    signals = _tile_signals(total_rows, rng, save_freq_s)
+    time_s = np.arange(total_rows) * save_freq_s
+    time_h = time_s / 3600.0
+
+    # Track events for labeling
+    labels = np.full(total_rows, 'NORMAL', dtype=object)
+    event_types = np.full(total_rows, 'normal', dtype=object)
+    ttf = np.full(total_rows, -1.0)
+
+    # ── 2. Schedule and splice decoy events ────────────────────────────────────
+    # Each decoy gets random duration (1–6h) and amplitude (0.4–1.6× the
+    # template's deviation from baseline), so no two decoys look the same.
+    if decoy_types and decoy_freq_per_day > 0:
+        n_decoys = rng.poisson(decoy_freq_per_day * duration_days)
+        decoy_times_s = np.sort(rng.uniform(0, total_s, size=n_decoys))
+
+        # Pre-simulate each decoy type once (full 6h template)
+        decoy_cache = {}
+        for dt_name in decoy_types:
+            if dt_name in _DECOY_LOAD_FNS and dt_name not in decoy_cache:
+                print(f"    Simulating decoy template: {dt_name}...", flush=True)
+                ddf = run_progpy(_DECOY_LOAD_FNS[dt_name], WEAR_X0_HEALTHY, faulty=False)
+                change_row = CHANGE_AT_S // save_freq_s
+                decoy_raw = ddf[_SIGNAL_COLS].values[change_row:]
+                # Store deviation from the tiled baseline at those rows
+                # so we can scale amplitude per event
+                decoy_cache[dt_name] = decoy_raw
+
+        # Get baseline values (mean of steady-state template) for amplitude scaling
+        tmpl_baseline = _build_template(save_freq_s)['template'].mean(axis=0)
+
+        used_windows = []
+
+        for t_s in decoy_times_s:
+            # Random duration: 1–6 hours
+            this_dur_h = rng.uniform(1.0, 6.0)
+            this_dur_rows = int(this_dur_h * 3600 / save_freq_s)
+
+            start_row = int(t_s / save_freq_s)
+            end_row = start_row + this_dur_rows
+            if end_row >= total_rows:
+                continue
+
+            overlap = any(not (end_row <= ws or start_row >= we)
+                          for ws, we in used_windows)
+            if overlap:
+                continue
+
+            dt_name = rng.choice(decoy_types)
+            if dt_name not in decoy_cache:
+                continue
+
+            # Random amplitude scale: 0.4–1.6× the deviation from baseline
+            amplitude = rng.uniform(0.4, 1.6)
+
+            full_splice = decoy_cache[dt_name]
+            # Trim or pad to this_dur_rows
+            n_avail = min(len(full_splice), this_dur_rows)
+            splice = full_splice[:n_avail].copy()
+
+            # Scale the deviation: splice = baseline + amplitude * (splice - baseline)
+            splice = tmpl_baseline + amplitude * (splice - tmpl_baseline)
+
+            # Add per-event noise so identical types look different
+            evt_noise = rng.normal(0, 1, size=splice.shape)
+            noise_stds = np.array([_TILE_NOISE_STD[c] for c in _SIGNAL_COLS])
+            splice += evt_noise * noise_stds * 2.0
+
+            _splice_window(signals, splice, start_row)
+            event_types[start_row:start_row + n_avail] = f'decoy_{dt_name}'
+            used_windows.append((start_row, start_row + n_avail))
+
+        print(f"    Spliced {len(used_windows)} decoy events (varied amplitude & duration)",
+              flush=True)
+    else:
+        used_windows = []
+
+    # ── 3. Splice failure episode ──────────────────────────────────────────────
+    fail_end_row = None
+    if failure_type and failure_type in _FAILURE_WEAR:
+        if failure_start_day is None:
+            failure_start_day = duration_days * rng.uniform(0.7, 0.9)
+
+        fail_start_s = failure_start_day * 86400
+        fail_start_row = int(fail_start_s / save_freq_s)
+
+        print(f"    Simulating {failure_type} failure (starts day {failure_start_day:.1f})...",
+              flush=True)
+        fdf = run_progpy(base_load, _FAILURE_WEAR[failure_type], faulty=True)
+        fail_signals = fdf[_SIGNAL_COLS].values
+        n_fail = min(len(fail_signals), total_rows - fail_start_row)
+
+        if n_fail > 0:
+            _splice_window(signals, fail_signals[:n_fail], fail_start_row)
+
+            fail_end_row = fail_start_row + n_fail
+            pre_fail_rows = PRE_FAIL_S // save_freq_s
+            pre_start = max(fail_start_row, fail_end_row - pre_fail_rows - 1)
+            labels[pre_start:fail_end_row - 1] = 'PRE_FAILURE'
+            labels[fail_end_row - 1] = 'FAILURE'
+            event_types[fail_start_row:fail_end_row] = f'failure_{failure_type}'
+
+            for i in range(pre_start, fail_end_row):
+                ttf[i] = max(0, (fail_end_row - 1 - i) * save_freq_s)
+
+            print(f"    Failure spliced: rows {fail_start_row}-{fail_end_row} "
+                  f"({n_fail} rows, {n_fail * save_freq_s / 3600:.1f}h)", flush=True)
+
+    # ── 3b. Post-failure flatline — pump is dead ──────────────────────────────
+    # After failure the device stops: speed→0, flow→0, temps→ambient + sensor noise
+    if fail_end_row is not None and fail_end_row < total_rows:
+        dead_rows = total_rows - fail_end_row
+        dead_values = {
+            'shaft_speed_rads': 0.0,
+            'flow_out_m3s':     0.0,
+            'thrust_bearing_K': TAMB,
+            'radial_bearing_K': TAMB,
+            'fluid_temp_K':     TAMB,
+            'flow_in_m3s':      0.0,
+            'pump_speed_rads':  0.0,
+            'impeller_area_A':  signals[fail_end_row - 1, _SIGNAL_COLS.index('impeller_area_A')],
+            'r_thrust':         signals[fail_end_row - 1, _SIGNAL_COLS.index('r_thrust')],
+            'r_radial':         signals[fail_end_row - 1, _SIGNAL_COLS.index('r_radial')],
+        }
+        for i, col in enumerate(_SIGNAL_COLS):
+            base_val = dead_values[col]
+            noise_std = _TILE_NOISE_STD[col] * 0.5  # quieter sensor noise on dead pump
+            signals[fail_end_row:, i] = base_val + rng.normal(0, noise_std, size=dead_rows)
+
+        # Temperatures cool down gradually (exponential decay to ambient over ~2h)
+        cool_tau = 2 * 3600 / save_freq_s  # 2-hour time constant in rows
+        for col_name in ['thrust_bearing_K', 'radial_bearing_K', 'fluid_temp_K']:
+            ci = _SIGNAL_COLS.index(col_name)
+            hot_val = signals[fail_end_row - 1, ci]
+            for r in range(dead_rows):
+                decay = (hot_val - TAMB) * np.exp(-r / cool_tau)
+                signals[fail_end_row + r, ci] = TAMB + decay + rng.normal(0, _TILE_NOISE_STD[col_name] * 0.3)
+
+        labels[fail_end_row:] = 'FAILURE'
+        event_types[fail_end_row:] = 'post_failure'
+        print(f"    Post-failure flatline: {dead_rows} rows ({dead_rows * save_freq_s / 86400:.1f} days)",
+              flush=True)
+
+    # ── 4. Assemble DataFrame ──────────────────────────────────────────────────
+    df = pd.DataFrame(signals, columns=_SIGNAL_COLS)
+    df['time_s'] = time_s
+    df['time_h'] = time_h
+    df['label'] = labels
+    df['time_to_failure_s'] = ttf
+    df['event_type'] = event_types
+
+    if 'flow_in_m3s' in df.columns and 'flow_out_m3s' in df.columns:
+        df['flow_gap_m3s'] = (df['flow_in_m3s'] - df['flow_out_m3s']).clip(lower=0)
+
+    return df
+
+
+def generate_dataset(
+    duration_days: float = 365.0,
+    save_freq_s: int = SAVE_FREQ,
+    decoy_freq_per_day: float = 2.0,
+    decoy_types: list[str] | None = None,
+    seed: int = 42,
+    output_dir: str = 'sample_data',
+) -> dict[str, pd.DataFrame]:
+    """
+    Generate a full dataset: one healthy series + one per failure type,
+    all with decoy events mixed in.
+
+    Parameters
+    ----------
+    duration_days : float        Duration of each series in days.
+    save_freq_s : int            Seconds between rows.
+    decoy_freq_per_day : float   Average decoy events per day in each series.
+    decoy_types : list           Decoy types to use.
+    seed : int                   Base seed (each series gets seed + offset).
+    output_dir : str             Directory for output files.
+
+    Returns
+    -------
+    dict mapping series name → DataFrame
+    """
+    if decoy_types is None:
+        decoy_types = list(_DECOY_LOAD_FNS.keys())
+
+    Path(output_dir).mkdir(exist_ok=True)
+
+    series_specs = [
+        ('normal_long',           None),
+        ('bearing_failure_long',  'bearing'),
+        ('impeller_failure_long', 'impeller'),
+        ('radial_failure_long',   'radial'),
+    ]
+
+    results = {}
+    meta_rows = []
+
+    for i, (name, fail_type) in enumerate(series_specs):
+        df = generate_long_series(
+            name=name,
+            duration_days=duration_days,
+            save_freq_s=save_freq_s,
+            failure_type=fail_type,
+            decoy_types=decoy_types,
+            decoy_freq_per_day=decoy_freq_per_day,
+            seed=seed + i,
+        )
+        df['scenario_id'] = i
+
+        # Save as parquet for large files, CSV for small
+        out_path = f"{output_dir}/{name}"
+        if len(df) > 50000:
+            df.to_parquet(f"{out_path}.parquet", index=False)
+            print(f"    → {out_path}.parquet ({len(df)} rows)")
+        else:
+            df.to_csv(f"{out_path}.csv", index=False)
+            print(f"    → {out_path}.csv ({len(df)} rows)")
+
+        meta_rows.append({
+            'scenario_id': i,
+            'scenario': name,
+            'group': fail_type or 'all',
+            'kind': 'failure' if fail_type else 'normal',
+            'faulty': fail_type is not None,
+            'duration_days': duration_days,
+            'decoy_freq_per_day': decoy_freq_per_day,
+            'description': f"{'Healthy' if not fail_type else fail_type.title() + ' failure'}"
+                           f" — {duration_days:.0f} days, ~{decoy_freq_per_day:.1f} decoys/day",
+        })
+        results[name] = df
+
+    meta_df = pd.DataFrame(meta_rows)
+    meta_df.to_csv(f"{output_dir}/scenarios_long.csv", index=False)
+    print(f"\n  Lookup table: {output_dir}/scenarios_long.csv ({len(meta_df)} rows)")
 
     return results
 
