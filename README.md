@@ -266,6 +266,10 @@ After failure the pump stops for 6 hours:
 
 Each instance has **random amplitude** (0.4–1.6×) and **random duration** (1–6h).
 
+### Planned maintenance (hard negative for failure)
+
+Scheduled shutdowns where the pump stops for 2–6 hours (controlled ramp-down → flat at zero → controlled ramp-up). Signals look identical to a real failure (speed=0, temps cool to ambient) but are labelled **NORMAL** with `event_type=maintenance`. A model that triggers on "pump stopped" will false-alarm on every maintenance window.
+
 ### Discrimination challenge
 
 A simple threshold on any single signal will false-alarm on decoys:
