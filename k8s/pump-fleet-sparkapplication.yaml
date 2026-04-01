@@ -1,0 +1,105 @@
+# SparkApplication for pump fleet generation on Kubernetes
+# Requires: Spark Operator (kubeflow/spark-operator) installed on the cluster
+#
+# Usage:
+#   kubectl apply -f k8s/pump-fleet-sparkapplication.yaml
+#
+# Monitor:
+#   kubectl get sparkapplication pump-fleet -o yaml
+#   kubectl logs pump-fleet-driver
+#
+# Delete:
+#   kubectl delete sparkapplication pump-fleet
+#
+# Quick test (override via kustomize or envsubst):
+#   export NUM_DEVICES=5 DURATION_DAYS=7 NUM_EXECUTORS=2
+#   envsubst < k8s/pump-fleet-sparkapplication.yaml | kubectl apply -f -
+
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: pump-fleet
+  namespace: default
+  labels:
+    app: synthetic-data
+    device-type: pump
+spec:
+  type: Python
+  mode: cluster
+  # Image built from Dockerfile.dataproc (or a K8s-specific Spark image)
+  # Replace with your registry path
+  image: "${REGISTRY}/pump-fleet-spark:latest"
+  imagePullPolicy: Always
+  sparkVersion: "3.5.0"
+
+  mainApplicationFile: "local:///opt/pump-fleet/spark_fleet_driver.py"
+  arguments:
+    - "--num-devices=${NUM_DEVICES:-100}"
+    - "--duration-days=${DURATION_DAYS:-7}"
+    - "--save-freq-s=${SAVE_FREQ_S:-60}"
+    - "--base-seed=${BASE_SEED:-12345}"
+    - "--output-path=${OUTPUT_PATH:-/data/output/pump-fleet}"
+
+  restartPolicy:
+    type: OnFailure
+  failureRetries: 2
+  submissionRetries: 3
+  submissionRetryInterval: 10
+
+  # Spark configuration
+  sparkConf:
+    spark.kubernetes.memoryOverheadFactor: "0.3"
+    spark.sql.shuffle.partitions: "100"
+    spark.dynamicAllocation.enabled: "true"
+    spark.dynamicAllocation.maxExecutors: "${MAX_EXECUTORS:-32}"
+
+  # Hadoop configuration for cloud storage (uncomment the relevant section)
+  # -- GCS --
+  # hadoopConf:
+  #   google.cloud.auth.service.account.enable: "true"
+  #   google.cloud.auth.service.account.json.keyfile: "/mnt/secrets/gcs/key.json"
+  # -- S3 --
+  # hadoopConf:
+  #   fs.s3a.aws.credentials.provider: "com.amazonaws.auth.DefaultAWSCredentialsProvider"
+  #   fs.s3a.endpoint: "s3.amazonaws.com"
+
+  volumes:
+    # Output volume — PVC for local cluster, or use cloud storage paths in arguments
+    - name: output-data
+      persistentVolumeClaim:
+        claimName: fleet-output-pvc
+    # Uncomment for GCS service account
+    # - name: gcs-secret
+    #   secret:
+    #     secretName: gcp-svc-account
+    #     defaultMode: 0400
+
+  driver:
+    cores: 2
+    coreLimit: "2000m"
+    memory: "4g"
+    serviceAccount: spark
+    labels:
+      app: synthetic-data
+      role: driver
+    volumeMounts:
+      - name: output-data
+        mountPath: /data/output
+    # env:
+    #   - name: GOOGLE_APPLICATION_CREDENTIALS
+    #     value: /mnt/secrets/gcs/key.json
+
+  executor:
+    cores: 4
+    coreLimit: "4000m"
+    memory: "8g"
+    instances: ${NUM_EXECUTORS:-4}
+    labels:
+      app: synthetic-data
+      role: executor
+    volumeMounts:
+      - name: output-data
+        mountPath: /data/output
+    # env:
+    #   - name: GOOGLE_APPLICATION_CREDENTIALS
+    #     value: /mnt/secrets/gcs/key.json

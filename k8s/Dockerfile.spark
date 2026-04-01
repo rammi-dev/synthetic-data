@@ -1,0 +1,43 @@
+# Spark image for Kubernetes Spark Operator
+# Includes progpy + generator code, based on official Apache Spark image
+#
+# Build:
+#   docker build -f k8s/Dockerfile.spark -t ${REGISTRY}/pump-fleet-spark:latest --target pump .
+#   docker build -f k8s/Dockerfile.spark -t ${REGISTRY}/motor-fleet-spark:latest --target motor .
+#
+# Multi-stage: shared base, then pump or motor target
+
+# ── Base stage: Spark + Python dependencies ──────────────────────────────────
+FROM apache/spark-py:v3.5.3 AS base
+
+USER root
+
+RUN pip install --no-cache-dir \
+    progpy==1.7.1 \
+    numpy>=2.0 \
+    pandas>=2.0 \
+    pyarrow>=15.0 \
+    scipy>=1.12 \
+    chaospy \
+    numpoly \
+    filterpy \
+    fastdtw \
+    tqdm
+
+USER spark
+
+# ── Pump fleet target ────────────────────────────────────────────────────────
+FROM base AS pump
+
+COPY sample_generator.py /opt/pump-fleet/sample_generator.py
+COPY fleet_generator.py /opt/pump-fleet/fleet_generator.py
+
+ENV PYTHONPATH="/opt/pump-fleet:${PYTHONPATH}"
+
+# ── Motor fleet target ───────────────────────────────────────────────────────
+FROM base AS motor
+
+COPY dcmotor_generator.py /opt/motor-fleet/dcmotor_generator.py
+COPY dcmotor_fleet_generator.py /opt/motor-fleet/dcmotor_fleet_generator.py
+
+ENV PYTHONPATH="/opt/motor-fleet:${PYTHONPATH}"

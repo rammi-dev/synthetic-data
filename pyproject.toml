@@ -15,4 +15,6 @@ dependencies = [
     "plotly>=6.6.0",
     "progpy>=1.7.1",
     "pyarrow>=23.0.1",
+    "scipy>=1.11.0",
+    "tqdm>=4.60.0",
 ]

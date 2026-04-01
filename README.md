@@ -1,6 +1,9 @@
-# Synthetic Pump Failure Data
+# Synthetic Failure Data (Pump & DC Motor)
 
-Synthetic time-series data for **load-testing and benchmarking ML pipelines** from a performance perspective. The data simulates centrifugal pump sensor readings using NASA's [progpy](https://nasa.github.io/progpy/) CentrifugalPump model.
+Synthetic time-series data for **load-testing and benchmarking ML pipelines** from a performance perspective. The data simulates sensor readings using NASA's [progpy](https://nasa.github.io/progpy/) physics models:
+
+- **Centrifugal Pump** — CentrifugalPump model with built-in wear/failure events
+- **DC Motor (Powertrain)** — ESC + DCMotor + PropellerLoad with externally modelled degradation
 
 **This is not production training data.** The purpose is to generate realistic-looking, correctly-structured time series at scale (up to 200GB+) so you can:
 - Stress-test data ingestion, feature engineering, and model training pipelines
@@ -8,9 +11,11 @@ Synthetic time-series data for **load-testing and benchmarking ML pipelines** fr
 - Validate that pipeline code handles failure labels, decoy events, multi-device partitioning, and mixed event types correctly
 - Develop and debug ML workflows before real sensor data is available
 
-Two modes of operation:
-1. **Sample notebook** — interactive exploration of failure signatures (4 series, ~150MB)
-2. **Fleet generator** — production-scale dataset from 1000s of unique devices (~200GB)
+Modes of operation:
+1. **Pump sample notebook** — interactive exploration of pump failure signatures (4 series, ~150MB)
+2. **DC motor sample notebook** — interactive exploration of motor degradation signatures (4 series)
+3. **Pump fleet generator** — production-scale pump dataset from 1000s of unique devices (~200GB)
+4. **Motor fleet generator** — production-scale motor dataset with the same fleet infrastructure
 
 ## Setup
 
@@ -21,7 +26,7 @@ uv sync
 
 ---
 
-## 1. Sample notebook
+## 1a. Pump sample notebook
 
 Open `sample_visualiser.ipynb` in VS Code or Jupyter and **Run All**.
 
@@ -39,8 +44,7 @@ uv run papermill sample_visualiser.ipynb output.ipynb \
   --progress-bar
 
 # Full year with diversity
-uv run papermill sample_visualiser.ipynb output.ipynb \
-  -p duration_days 365 \
+uv run papermill sample_visualiser.ipynb output_downsampled.ipynb \
   -p failure_severity 0 \
   -p ambient_var_K 5.0 \
   -p duty_cycle_var 0.5 \
@@ -55,7 +59,7 @@ uv run papermill sample_visualiser.ipynb output.ipynb \
   --progress-bar
 ```
 
-### Notebook parameters
+### Pump notebook parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -73,7 +77,46 @@ uv run papermill sample_visualiser.ipynb output.ipynb \
 
 ---
 
-## 2. Fleet generator (production scale)
+## 1b. DC Motor sample notebook
+
+Open `dcmotor_visualiser.ipynb` in VS Code or Jupyter and **Run All**.
+
+Uses NASA's progpy **Powertrain** model (ESC + DCMotor + PropellerLoad). Since the Powertrain has no built-in failure events, degradation is modelled externally by evolving motor parameters over time. A calibration grid of ~90 short progpy simulations (2s each at dt=2e-5) maps parameter values to steady-state signals.
+
+If data files already exist in `motor_sample_data/`, the notebook loads them directly.
+Delete `motor_sample_data/` to force regeneration.
+
+### Running with papermill
+
+```bash
+# Full year with diversity
+uv run papermill dcmotor_visualiser.ipynb dcmotor_output_downsampled.ipynb \
+  -p failure_severity 0 \
+  -p ambient_var_K 5.0 \
+  -p duty_cycle_var 0.5 \
+  -p downsample 50 \
+  --progress-bar
+
+# Quick test — 7 days, long series only
+uv run papermill dcmotor_visualiser.ipynb dcmotor_output.ipynb \
+  -p duration_days 7 \
+  -p run_short_scenarios false \
+  -p downsample 50 \
+  --progress-bar
+```
+
+### Motor notebook parameters
+
+Same parameters as the pump notebook (see table above), plus motor-specific behaviour:
+
+- **3 failure modes:** winding degradation (R↑), bearing wear (B↑), demagnetization (K↓)
+- **6 decoy types:** load step/ramp, voltage sag step/ramp, duty cycle step/ramp
+- **10 short scenarios** (1 normal + 3 failures + 6 decoys)
+- **4 long series** (normal, winding failure, bearing failure, demag failure)
+
+---
+
+## 2a. Pump fleet generator (production scale)
 
 `fleet_generator.py` creates thousands of unique pump devices as individual parquet files, parallelized across CPU cores.
 
@@ -207,7 +250,74 @@ fleet_data/
 
 ---
 
+## 2b. Motor fleet generator (production scale)
+
+`dcmotor_fleet_generator.py` creates thousands of unique motor devices. Same architecture as the pump fleet generator.
+
+### Quick test
+
+```bash
+uv run python dcmotor_fleet_generator.py \
+  --num-devices 5 \
+  --duration-days 7 \
+  --output-dir test_motor_fleet \
+  --max-workers 2
+```
+
+### Full generation
+
+```bash
+uv run python dcmotor_fleet_generator.py \
+  --num-devices 6000 \
+  --duration-days 365 \
+  --output-dir /data/motor_fleet \
+  --max-workers 31
+```
+
+### Motor fleet parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--num-devices` | 6000 | Number of unique motor devices |
+| `--duration-days` | 365 | Time series length per device |
+| `--save-freq-s` | 60 | Seconds between rows |
+| `--max-workers` | 0 | Parallel workers (0 = cpu_count - 1) |
+| `--base-seed` | 12345 | Base random seed |
+| `--output-dir` | motor_fleet_data | Output directory |
+| `--healthy-fraction` | 0.4 | Fraction of devices with no failure |
+| `--winding-fraction` | 0.2 | Fraction with winding degradation |
+| `--bearing-fraction` | 0.2 | Fraction with bearing wear |
+| `--demag-fraction` | 0.2 | Fraction with demagnetization |
+| `--config` | — | JSON config file (overrides CLI defaults) |
+
+### What makes each motor device unique
+
+| Parameter | Distribution | Effect |
+|-----------|-------------|--------|
+| `failure_type` | Categorical (40/20/20/20%) | Healthy, winding, bearing, or demag |
+| `failure_start_day` | Uniform(30%–95% of duration) | Failures start at different times |
+| `failure_severity` | LogNormal(0, 0.4), clipped 0.3–3.0x | Degradation speed varies |
+| `ambient_var_K` | Uniform(2–12 K) | Temperature environment varies |
+| `duty_cycle_var` | Uniform(0.1–0.8) | 24/7 vs shift operation |
+| `decoy_freq_per_day` | Exponential(λ=2), clipped 0–8 | Operational disturbance frequency |
+| `decoy_types` | Random 1–6 subset | Not all sites see all input changes |
+| `noise_scale` | Uniform(0.5–2.0) | Sensor quality varies |
+| `v_offset` | Normal(0, ±2% V_NOM) | Supply voltage varies |
+
+### Motor sizing reference
+
+| Devices | Duration | Rows/device | File size/device | Total |
+|---------|----------|-------------|-----------------|-------|
+| 5 | 7 days | 10K | ~0.6 MB | ~3 MB |
+| 100 | 30 days | 43K | ~2.5 MB | ~250 MB |
+| 1,000 | 365 days | 525K | ~25 MB | ~25 GB |
+| 6,000 | 365 days | 525K | ~25 MB | ~150 GB |
+
+---
+
 ## Column reference
+
+### Pump signals
 
 **Signal columns** (sensor-observable):
 
@@ -238,7 +348,31 @@ fleet_data/
 | `event_type` | `normal`, `decoy_*`, `failure_*`, `post_failure`, `startup`, `maintenance` | Current event |
 | `scenario_id` / `device_id` | int / str | Series identifier |
 
+### DC Motor signals
+
+**Signal columns** (sensor-observable):
+
+| Column | Unit | Description |
+|--------|------|-------------|
+| `rotational_velocity_rads` | rad/s | Motor rotational velocity |
+| `current_rms_A` | A | RMS current across 3 phases |
+| `torque_load_Nm` | Nm | Propeller load torque (C_q · v_rot²) |
+| `mechanical_power_W` | W | Mechanical output power (torque × speed) |
+| `electrical_power_W` | W | Electrical input power (voltage × current) |
+
+**State columns** (model-internal, not directly measurable):
+
+| Column | Description |
+|--------|-------------|
+| `resistance_ohm` | Winding resistance — increases with winding degradation |
+| `friction_coeff` | Bearing friction coefficient — increases with bearing wear |
+| `backemf_constant` | Back-emf / torque constant — decreases with demagnetization |
+
+---
+
 ## Failure modes
+
+### Pump failure modes
 
 Based on [progpy CentrifugalPump](https://nasa.github.io/progpy/) physics:
 
@@ -270,12 +404,36 @@ Each instance has **random amplitude** (0.4–1.6×) and **random duration** (1�
 
 Scheduled shutdowns where the pump stops for 2–6 hours (controlled ramp-down → flat at zero → controlled ramp-up). Signals look identical to a real failure (speed=0, temps cool to ambient) but are labelled **NORMAL** with `event_type=maintenance`. A model that triggers on "pump stopped" will false-alarm on every maintenance window.
 
+### Motor failure modes
+
+Since the Powertrain model has no built-in events, degradation is modelled by evolving parameters over time via a calibration grid:
+
+| Mode | Parameter | Physics | Threshold |
+|------|-----------|---------|-----------|
+| Winding degradation | R: 0.081 → 0.30 Ω | I²R losses grow, speed drops, current rises | v_rot < 40% healthy |
+| Bearing wear | B: 0 → 0.0015 | Friction absorbs energy, speed drops | v_rot < 40% healthy |
+| Demagnetization | K: 0.0265 → 0.012 | Back-emf drops, torque-current coupling shifts | v_rot < 40% healthy |
+
+### Motor decoy events
+
+| Decoy | What it does | Mimics |
+|-------|-------------|--------|
+| `load_step` / `load_ramp` | Propeller load increases (C_q × 2.5) | Winding degradation (speed drops + current rises) |
+| `voltage_sag_step` / `voltage_sag_ramp` | Supply voltage drops to 75% | Bearing wear (speed drops) |
+| `duty_step` / `duty_ramp` | Duty cycle drops to 60% | Demagnetization (speed/power change) |
+
 ### Discrimination challenge
 
 A simple threshold on any single signal will false-alarm on decoys:
 
+**Pump:**
 - **Bearing wear vs high-load:** both show Tt rising. Discriminator: Tt vs speed relationship
 - **Impeller wear vs back-pressure:** both show flow dropping. Discriminator: flow vs temperature relationship
+
+**DC Motor:**
+- **Winding vs load change:** both show speed dropping + current rising. Discriminator: current vs speed relationship (I²R loss creates disproportionate current rise)
+- **Bearing vs voltage sag:** both show speed dropping. Discriminator: mechanical power vs speed (friction causes unexplained power loss)
+- **Demag vs duty change:** both show speed changing. Discriminator: electrical power vs torque relationship (K affects torque-current coupling)
 
 ---
 
@@ -418,18 +576,130 @@ Based on Dataproc Serverless pricing (~$0.06/vCPU-hour + ~$0.01/GB-hour).
 
 ---
 
+## 3b. GCP Dataproc Serverless — DC Motor
+
+Same approach as pump, using `dataproc_submit_motor.sh` and `Dockerfile.dataproc.motor`.
+
+### Quick test
+
+```bash
+NUM_DEVICES=5 DURATION_DAYS=1 NUM_EXECUTORS=2 ./dataproc_submit_motor.sh
+```
+
+### Full generation
+
+```bash
+./dataproc_submit_motor.sh
+```
+
+Or with explicit config:
+
+```bash
+PROJECT=my-project \
+BUCKET=my-motor-data \
+NUM_DEVICES=6000 \
+DURATION_DAYS=365 \
+NUM_EXECUTORS=16 \
+./dataproc_submit_motor.sh
+```
+
+Motor generation is ~50% slower than pump due to the calibration grid init (~10 min per executor). See [doc/fleet_generation.md](doc/fleet_generation.md) for full memory and timing profiles.
+
+### Motor fleet parameters
+
+Same CLI env vars as pump (see section 3), with these defaults changed:
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `BUCKET` | `${PROJECT}-motor-data` | Separate bucket from pump |
+| `BATCH_ID` | `motor-fleet-YYYYMMDD-HHMMSS` | |
+| `AR_REPO` | `motor-fleet` | Separate container repo |
+
+---
+
+## 4. Kubernetes Spark Operator
+
+Run fleet generation on any Kubernetes cluster with the [Spark Operator](https://github.com/kubeflow/spark-operator). SparkApplication CRD manifests are provided in `k8s/`.
+
+### Prerequisites
+
+```bash
+# Install Spark Operator
+helm repo add spark-operator https://kubeflow.github.io/spark-operator
+helm install spark-operator spark-operator/spark-operator \
+  --namespace spark-operator --create-namespace
+
+# Create service account + PVC (see doc/fleet_generation.md for details)
+kubectl create serviceaccount spark
+kubectl create clusterrolebinding spark-role \
+  --clusterrole=edit --serviceaccount=default:spark
+```
+
+### Build images
+
+```bash
+# Multi-stage Dockerfile — pump and motor targets
+docker build -f k8s/Dockerfile.spark --target pump \
+  -t ${REGISTRY}/pump-fleet-spark:latest .
+docker build -f k8s/Dockerfile.spark --target motor \
+  -t ${REGISTRY}/motor-fleet-spark:latest .
+```
+
+### Submit
+
+```bash
+# Quick test
+export REGISTRY=my-registry.io NUM_DEVICES=5 DURATION_DAYS=7 NUM_EXECUTORS=2
+envsubst < k8s/pump-fleet-sparkapplication.yaml | kubectl apply -f -
+envsubst < k8s/motor-fleet-sparkapplication.yaml | kubectl apply -f -
+
+# Full run
+export NUM_DEVICES=6000 DURATION_DAYS=365 NUM_EXECUTORS=16
+envsubst < k8s/pump-fleet-sparkapplication.yaml | kubectl apply -f -
+```
+
+### Monitor
+
+```bash
+kubectl get sparkapplication
+kubectl logs pump-fleet-driver
+kubectl delete sparkapplication pump-fleet
+```
+
+Supports PVC, GCS, or S3 output — see comments in the YAML manifests. Full details in [doc/fleet_generation.md](doc/fleet_generation.md).
+
+---
+
 ## Architecture
 
 ```
-sample_generator.py          # progpy simulation + long series tiling engine
-sample_visualiser.ipynb       # interactive notebook (papermill-compatible)
-fleet_generator.py            # production-scale parallel generator (local)
-dataproc_submit.sh            # GCP Dataproc Serverless submission script
-sample_data/                  # notebook output (gitignored)
-fleet_data/                   # local fleet output (gitignored)
+sample_generator.py           # pump: progpy simulation + long series tiling engine
+sample_visualiser.ipynb       # pump: interactive notebook (papermill-compatible)
+fleet_generator.py            # production-scale parallel pump generator (local)
+dataproc_submit.sh            # pump: GCP Dataproc Serverless submission
+Dockerfile.dataproc           # pump: custom Spark container
+
+dcmotor_generator.py          # motor: progpy Powertrain simulation + calibration grid
+dcmotor_visualiser.ipynb      # motor: interactive notebook (papermill-compatible)
+dcmotor_fleet_generator.py    # production-scale parallel motor generator (local)
+dataproc_submit_motor.sh      # motor: GCP Dataproc Serverless submission
+Dockerfile.dataproc.motor     # motor: custom Spark container
+
+k8s/
+  pump-fleet-sparkapplication.yaml   # Spark Operator CRD for pump fleet
+  motor-fleet-sparkapplication.yaml  # Spark Operator CRD for motor fleet
+  Dockerfile.spark                   # multi-stage Spark image (pump + motor targets)
+
+doc/
+  fleet_generation.md         # memory profile, file layout, architecture details
+
+sample_data/                  # pump notebook output (gitignored)
+motor_sample_data/            # motor notebook output (gitignored)
+fleet_data/                   # local pump fleet output (gitignored)
+motor_fleet_data/             # local motor fleet output (gitignored)
 ```
 
-### How the tiling engine works
+### How the pump tiling engine works
 
 Instead of running progpy for 365 days (would take hours), the generator:
 1. Runs progpy **once** for 6h → extracts a 1-hour steady-state template
@@ -440,3 +710,23 @@ Instead of running progpy for 365 days (would take hours), the generator:
 6. After failure: 6h **downtime** (cooling) then **restart ramp** back to normal
 
 Total progpy calls: ~8 regardless of duration. Generation is O(1) in time series length.
+
+### How the motor calibration engine works
+
+The DC motor approach differs because the Powertrain model has no built-in failure events:
+1. Builds a **calibration grid**: ~90 short (2s) progpy Powertrain sims across parameter ranges (R, B, K, load, voltage, duty)
+2. Each sim runs at dt=2e-5 to capture PWM dynamics, extracts steady-state averages
+3. For each timestep in the output series, **interpolates** the grid at the current degraded parameter value
+4. Degradation follows an **exponential curve** from nominal to failure over ~6h
+5. Decoy events blend to the grid value for the changed input (load/voltage/duty)
+6. Long series use the same tiling + splicing strategy as the pump generator
+
+Total progpy calls: ~90 for the calibration grid (one-time, cached). Generation is O(n) in time series rows but fast (no progpy per row).
+
+### Fleet memory & file layout
+
+See [doc/fleet_generation.md](doc/fleet_generation.md) for detailed documentation on:
+- Per-worker memory profile (what allocates, how much, when it's freed)
+- File layout for local and Dataproc fleet generation
+- Dataproc executor sizing recommendations
+- Resumability and partition strategy

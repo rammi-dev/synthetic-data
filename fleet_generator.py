@@ -180,10 +180,18 @@ def _worker_init():
 
 
 def generate_single_device(cfg: DeviceConfig, output_dir: str) -> dict:
-    """Generate data for a single device and write to parquet."""
+    """Generate data for a single device and write to parquet.
+
+    Uses output_path to write parquet inside generate_long_series,
+    avoiding a second copy of the full DataFrame in memory.
+    """
     t0 = time.time()
     try:
-        df = generate_long_series(
+        devices_dir = Path(output_dir) / 'devices'
+        devices_dir.mkdir(parents=True, exist_ok=True)
+        out_path = devices_dir / f"{cfg.device_id}.parquet"
+
+        n_rows = generate_long_series(
             name=cfg.device_id,
             duration_days=cfg.duration_days,
             save_freq_s=SAVE_FREQ,
@@ -199,18 +207,13 @@ def generate_single_device(cfg: DeviceConfig, output_dir: str) -> dict:
             decoy_cache=_WORKER_DECOY_CACHE,
             v_offset=cfg.v_offset,
             p_offset=cfg.p_offset,
+            output_path=str(out_path),
         )
-        df['device_id'] = cfg.device_id
-
-        devices_dir = Path(output_dir) / 'devices'
-        devices_dir.mkdir(parents=True, exist_ok=True)
-        out_path = devices_dir / f"{cfg.device_id}.parquet"
-        df.to_parquet(out_path, index=False)
 
         elapsed = time.time() - t0
         return {
             'device_id': cfg.device_id,
-            'num_rows': len(df),
+            'num_rows': n_rows,
             'file_size_bytes': out_path.stat().st_size,
             'generation_time_s': round(elapsed, 2),
             'status': 'completed',

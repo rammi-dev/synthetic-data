@@ -643,7 +643,8 @@ def generate_long_series(
     decoy_cache: dict | None = None,
     v_offset: float = 0.0,
     p_offset: float = 0.0,
-) -> pd.DataFrame:
+    output_path: str | None = None,
+) -> pd.DataFrame | int:
     """
     Generate a long pump time series (days to years).
 
@@ -673,10 +674,12 @@ def generate_long_series(
                            skips per-call decoy simulation.
     v_offset : float       Voltage offset from nominal — shifts shaft speed proportionally.
     p_offset : float       Pressure offset from nominal — shifts flow columns proportionally.
+    output_path : str      If given, write parquet directly and return row count
+                           (avoids keeping the full DataFrame in memory — fleet mode).
 
     Returns
     -------
-    pd.DataFrame with signal columns, time_s, time_h, label, scenario_id, event_type.
+    pd.DataFrame (default) or int (row count, if output_path is given).
     """
     rng = np.random.default_rng(seed)
     total_s = duration_days * 86400
@@ -963,6 +966,7 @@ def generate_long_series(
 
     # ── 4. Assemble DataFrame ──────────────────────────────────────────────────
     df = pd.DataFrame(signals, columns=_SIGNAL_COLS)
+    del signals  # free the numpy array — DataFrame owns the data now
     df['time_s'] = time_s
     df['time_h'] = time_h
     df['label'] = labels
@@ -971,6 +975,14 @@ def generate_long_series(
 
     if 'flow_in_m3s' in df.columns and 'flow_out_m3s' in df.columns:
         df['flow_gap_m3s'] = (df['flow_in_m3s'] - df['flow_out_m3s']).clip(lower=0)
+
+    # Write to parquet immediately if path given (fleet mode — avoids returning
+    # the full DataFrame to the caller and keeping two copies in memory).
+    if output_path is not None:
+        df.to_parquet(output_path, index=False)
+        n_rows = len(df)
+        del df
+        return n_rows
 
     return df
 

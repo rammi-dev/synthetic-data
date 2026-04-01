@@ -9,9 +9,19 @@ wheels/
 # Virtual environments
 .venv
 
-# Generated data and plots
+# Generated data and plots (pump)
 sample_data/
 plots/
 fleet_data/
 test_fleet/
+
+# Generated data and plots (DC motor)
+motor_sample_data/
+motor_plots/
+motor_fleet_data/
+test_motor_fleet/
+
+# Executed notebooks (papermill output)
+*_executed.ipynb
+*_output*.ipynb
 
