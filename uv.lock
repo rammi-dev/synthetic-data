@@ -3058,6 +3058,8 @@ dependencies = [
     { name = "plotly" },
     { name = "progpy" },
     { name = "pyarrow" },
+    { name = "scipy" },
+    { name = "tqdm" },
 ]
 
 [package.metadata]
@@ -3072,6 +3074,8 @@ requires-dist = [
     { name = "plotly", specifier = ">=6.6.0" },
     { name = "progpy", specifier = ">=1.7.1" },
     { name = "pyarrow", specifier = ">=23.0.1" },
+    { name = "scipy", specifier = ">=1.11.0" },
+    { name = "tqdm", specifier = ">=4.60.0" },
 ]
 
 [[package]]

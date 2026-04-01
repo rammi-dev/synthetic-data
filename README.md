@@ -713,13 +713,60 @@ Total progpy calls: ~8 regardless of duration. Generation is O(1) in time series
 
 ### How the motor calibration engine works
 
-The DC motor approach differs because the Powertrain model has no built-in failure events:
-1. Builds a **calibration grid**: ~90 short (2s) progpy Powertrain sims across parameter ranges (R, B, K, load, voltage, duty)
-2. Each sim runs at dt=2e-5 to capture PWM dynamics, extracts steady-state averages
-3. For each timestep in the output series, **interpolates** the grid at the current degraded parameter value
-4. Degradation follows an **exponential curve** from nominal to failure over ~6h
-5. Decoy events blend to the grid value for the changed input (load/voltage/duty)
-6. Long series use the same tiling + splicing strategy as the pump generator
+The DC motor approach differs fundamentally from the pump because of two constraints:
+
+1. **No built-in failure events** — the progpy Powertrain model (ESC + DCMotor + PropellerLoad) models healthy motor physics but has no wear or degradation parameters. Failures must be modelled externally.
+2. **Tiny timestep required** — the ESC's PWM commutation runs at 16 kHz, requiring dt=0.00002s for numerical stability. Simulating even 1 hour would take 180 million steps — simulating 365 days is impossible.
+
+#### The simplification: steady-state lookup table
+
+Instead of running the full physics model at every timestep, we observe that a brushless DC motor reaches steady state within ~1 second for any given set of parameters. So we:
+
+1. **Pre-compute a calibration grid** — run ~90 short simulations (2 seconds each at dt=2e-5), varying one parameter at a time across its degradation range:
+
+   | Grid | Parameter varied | Points | Range |
+   |------|-----------------|--------|-------|
+   | Winding | R (resistance) | 15 | 0.081 → 0.300 Ω |
+   | Bearing | B (friction) | 15 | 0.000 → 0.0015 |
+   | Demag | K (back-emf constant) | 15 | 0.0265 → 0.012 |
+   | Load | C_q multiplier | 15 | 1.0 → 2.5 |
+   | Voltage | V (supply) | 15 | 23.0 → 17.2 V |
+   | Duty | duty cycle | 15 | 1.0 → 0.60 |
+
+2. **Extract steady-state averages** from each sim — rotational velocity, RMS current, torque, mechanical power, electrical power
+
+3. **Generate time series by interpolation** — for each 60-second output row, compute the current degraded parameter value (e.g. "at hour 4, R has grown to 0.15 Ω"), then linearly interpolate the grid to get the corresponding signal values
+
+This is a key simplification: **we assume the motor reaches steady state instantly** relative to the 60-second sampling interval. This is physically reasonable — a brushless DC motor settles in <1s, and parameter degradation happens over hours. The 60s rows represent averaged steady-state values, not transient dynamics.
+
+#### What this means in practice
+
+- **First run is slow** (~10 min) — building the 90-sim calibration grid
+- **Subsequent runs are instant** — grid is cached in memory per process (`_GRID_CACHE`)
+- **365-day series generation takes ~5s** — just array operations, no progpy
+- **Accuracy trade-off** — transient dynamics (startup surges, PWM ripple) are lost. The data represents smoothed steady-state behaviour at 1-minute resolution, which is appropriate for anomaly detection and prognostics use cases but would not be suitable for high-frequency motor control analysis
+
+#### Degradation model
+
+Since progpy has no motor wear model, degradation is applied as an external exponential curve:
+
+```
+parameter(t) = nominal + (failure - nominal) × (e^(3·t/T_fail) - 1) / (e^3 - 1)
+```
+
+This gives slow onset followed by accelerating degradation — physically realistic for winding insulation breakdown, bearing wear, and magnet demagnetization.
+
+#### Comparison with pump approach
+
+| Aspect | Pump | DC Motor |
+|--------|------|----------|
+| progpy model | CentrifugalPump | Powertrain (ESC+DCMotor+PropellerLoad) |
+| Built-in wear | Yes (wA, wRadial, wThrust) | No |
+| Required dt | Default (~1s) | 2e-5 (PWM fidelity) |
+| Failure simulation | Run progpy with wear params | Interpolate calibration grid |
+| Init time | ~30s (5 sims) | ~10 min (90 sims) |
+| Per-device time (365d) | ~10-15s | ~5-10s |
+| Simplification | Template tiling (1h cycle repeated) | Steady-state assumption |
 
 Total progpy calls: ~90 for the calibration grid (one-time, cached). Generation is O(n) in time series rows but fast (no progpy per row).
 
