@@ -22,7 +22,8 @@ motor_fleet_data/
 test_motor_fleet/
 
 # Executed notebooks (papermill output)
-^decotor*downsampled.ipynd
+
 *_executed.ipynb
-*_output*.ipynb
+
+^decotor*downsampled.ipynd
 
